@@ -160,8 +160,10 @@ S=$T/system
 bb mkdir -p "$S"
 if [ -n "$SYSTEM" ] && bb mount -o ro -t ext4 "$SYSTEM" "$S" 2>/dev/null; then
 	if [ -f "$S/etc/firmware/bcm4329.hcd" ]; then
+		# /lib/firmware: the only firmware path the kernel searches.
+		bb mkdir -p "$NEW/lib/firmware/brcm"
 		for b in wingray mz605; do
-			bb cp "$S/etc/firmware/bcm4329.hcd" "$NEW/usr/lib/firmware/brcm/BCM4329B1.motorola,$b.hcd"
+			bb cp "$S/etc/firmware/bcm4329.hcd" "$NEW/lib/firmware/brcm/BCM4329B1.motorola,$b.hcd"
 		done
 		ui "Bluetooth firmware copied from the Android system partition"
 	else
@@ -224,7 +226,7 @@ ui " "
 ui "Done. Nura is in /data/linux/$OS."
 ui "Login user: user   password: 147147   (change it with: passwd)"
 ui "Wi-Fi: put 'SSID<TAB>password' lines in /sdcard/NuraXoom/wifi.txt"
-ui "       before rebooting, or use Sxmo > Scripts > Wi-Fi."
+ui "       before rebooting, or use Sxmo > Networks."
 ui "Logs:  /sdcard/NuraXoom/logs   Undo: NuraXoom-restore-boot.zip"
 ui "Reboot > System."
 cleanup

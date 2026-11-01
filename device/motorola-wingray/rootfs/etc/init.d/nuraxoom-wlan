@@ -19,7 +19,9 @@ start() {
 		[ -n "$cid" ] || cid=$(cat /etc/machine-id 2>/dev/null)
 		h=$(printf '%s' "$cid" | sha256sum | cut -c1-10)
 		mac="02:$(echo $h | sed 's/../&:/g; s/:$//')"
-		fw=/usr/lib/firmware/brcm
+		# The kernel only searches /lib/firmware (not /usr/lib/firmware).
+		fw=/lib/firmware/brcm
+		mkdir -p $fw
 		for b in wingray mz605; do
 			{ grep -v '^macaddr=' /usr/share/nuraxoom/stock-wifi-nvram.txt; echo "macaddr=$mac"; } \
 				> $fw/brcmfmac4329-sdio.motorola,$b.txt.new && mv -f $fw/brcmfmac4329-sdio.motorola,$b.txt.new $fw/brcmfmac4329-sdio.motorola,$b.txt
