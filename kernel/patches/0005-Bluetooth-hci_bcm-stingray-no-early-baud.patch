@@ -1,0 +1,24 @@
+diff --git a/drivers/bluetooth/hci_bcm.c b/drivers/bluetooth/hci_bcm.c
+index ae08059d3..793fb3f49 100644
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -1634,7 +1634,19 @@ static struct bcm_device_data cyw55572_device_data = {
+ 	.max_autobaud_speed = 921600,
+ };
+ 
++/*
++ * Motorola Xoom (Stingray family): patch the BCM4329B1 at 115200 and switch to
++ * the operational speed afterwards, as Android brcm_patchram_plus did. With an
++ * early baud switch the chip stops answering after the firmware patch
++ * (0xfc18 tx timeout); it has no 48 MHz UART clock command (0xfc45) either.
++ */
++static struct bcm_device_data stingray_bcm4329_device_data = {
++	.no_early_set_baudrate = true,
++	.no_uart_clock_set = true,
++};
++
+ static const struct of_device_id bcm_bluetooth_of_match[] = {
++	{ .compatible = "motorola,stingray-bcm4329-bt", .data = &stingray_bcm4329_device_data },
+ 	{ .compatible = "brcm,bcm20702a1" },
+ 	{ .compatible = "brcm,bcm43241b0-bt" },
+ 	{ .compatible = "brcm,bcm4329-bt" },

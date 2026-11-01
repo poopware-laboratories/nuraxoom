@@ -1,0 +1,6 @@
+# Rename this file to wifi.txt (same folder: /sdcard/NuraXoom/) before first boot.
+# One network per line: network name, a TAB (or a | ), then the password.
+# Nura imports it once on boot and renames it to wifi.txt.imported.
+#
+# MyHomeWiFi|my secret password
+# CoffeeShop|

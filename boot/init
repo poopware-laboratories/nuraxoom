@@ -1,0 +1,264 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# xoomboot - NuraXoom generic boot init for the Motorola Xoom (wingray)
+#
+# Boots any Linux distribution whose root filesystem lives in its own
+# directory on the Android userdata partition:
+#
+#     /data/linux/<name>/            root filesystem (has /sbin/init)
+#     /data/linux/<name>.conf        optional per-OS settings (see below)
+#     /data/linux/boot.conf          optional global settings
+#     /data/linux/.kernel/           shared kernel modules + firmware
+#
+# Nothing is ever formatted or repartitioned. Logs are written to
+# /data/media/0/NuraXoom/logs (= /sdcard/NuraXoom/logs in Android/TWRP),
+# so a failed boot can be diagnosed from TWRP without a USB cable.
+#
+# Keys in the menu: Volume Down = next entry, Volume Up = boot it.
+# Without a key press the default entry boots after the timeout.
+
+export PATH=/bin
+XB_VERSION=@VERSION@
+DATA=/android
+LINUX=$DATA/linux
+LOGDIR_REL=media/0/NuraXoom/logs
+NEWROOT=/newroot
+KREL=$(uname -r)
+TTY=/dev/tty1
+
+/bin/busybox --install -s /bin
+mkdir -p /dev /proc /sys /run /tmp $DATA $NEWROOT
+mount -t devtmpfs -o mode=0755 devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+# /run is moved into the booted OS (XDG_RUNTIME_DIR, dbus...): not too small
+mount -t tmpfs -o mode=0755,size=10% tmpfs /run
+[ -e /dev/tty1 ] || TTY=/dev/console
+LOG=/run/xoomboot.log
+: > $LOG
+
+say() {
+	echo "$*" >> $LOG
+	echo "$*" > $TTY 2>/dev/null
+}
+
+# Persist everything we know to /sdcard/NuraXoom/logs if userdata is mounted.
+save_logs() {
+	mountpoint -q $DATA || return 0
+	d=$DATA/$LOGDIR_REL
+	mkdir -p $d 2>/dev/null || return 0
+	cp $LOG $d/xoomboot.log
+	dmesg > $d/dmesg-boot.txt 2>/dev/null
+	if [ -d /sys/fs/pstore ] && [ -n "$(ls /sys/fs/pstore 2>/dev/null)" ]; then
+		p=$d/pstore-previous-boot
+		rm -rf $p; mkdir -p $p
+		cp /sys/fs/pstore/* $p/ 2>/dev/null
+	fi
+	sync
+}
+
+# Last resort: tell the user, keep the message up, then reboot.
+die() {
+	say ""
+	say "xoomboot: BOOT FAILED: $*"
+	say "A log was saved to /sdcard/NuraXoom/logs/xoomboot.log"
+	say "Rebooting in 60 seconds. Hold Power + Volume Down for recovery."
+	save_logs
+	# A USB-OTG keyboard still gets a shell on tty2.
+	setsid sh -c "exec sh </dev/tty2 >/dev/tty2 2>&1" &
+	# The panel can come up long after this message was printed: keep
+	# redrawing it, with what the kernel saw, until the reboot.
+	why="$*"
+	n=24
+	while [ $n -gt 0 ]; do
+		{
+			printf '\033[2J\033[H'
+			echo "xoomboot $XB_VERSION: BOOT FAILED: $why"
+			echo "Rebooting in $((n * 5)) s. Hold Power + Volume Down for recovery."
+			echo
+			echo "block devices: $(cd /sys/class/block 2>/dev/null && echo *)"
+			echo
+			dmesg | grep -i -E 'mmc|sdhci|error|fail|defer' | tail -n 14
+		} > $TTY 2>/dev/null
+		sleep 5
+		n=$((n - 1))
+	done
+	sync
+	reboot -f
+}
+
+[ -e /sys/fs/pstore ] && mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+
+say "xoomboot $XB_VERSION on $KREL"
+say "$(cat /proc/device-tree/model 2>/dev/null)"
+
+# ---------------------------------------------------------------- userdata
+find_userdata() {
+	for u in /sys/class/block/*/uevent; do
+		grep -q '^PARTNAME=userdata$' "$u" 2>/dev/null || continue
+		n=$(sed -n 's/^DEVNAME=//p' "$u")
+		[ -b "/dev/$n" ] && { echo "/dev/$n"; return 0; }
+	done
+	# No GPT names: any ext4 partition that carries /linux
+	for b in /dev/mmcblk*p*; do
+		[ -b "$b" ] || continue
+		case "$(blkid "$b" 2>/dev/null)" in *'TYPE="ext4"'*) ;; *) continue;; esac
+		mount -t ext4 -o ro "$b" $DATA 2>/dev/null || continue
+		if [ -d $LINUX ]; then umount $DATA; echo "$b"; return 0; fi
+		umount $DATA
+	done
+	return 1
+}
+
+# The eMMC can appear late (deferred probe); ChatGPT's init waited 30 s and
+# 10 s was not enough here. Give it 90 s and say what we see meanwhile.
+i=0
+while :; do
+	DEV=$(find_userdata) && break
+	i=$((i + 1))
+	[ $i -ge 90 ] && die "userdata partition not found"
+	[ $((i % 5)) = 0 ] && say "waiting for userdata (${i}s), block devices: $(cd /sys/class/block && echo *)"
+	sleep 1
+done
+say "userdata: $DEV"
+mount -t ext4 -o rw,noatime "$DEV" $DATA || die "cannot mount $DEV"
+# Save now (incl. the previous boot's pstore): a later crash must not lose it.
+save_logs
+[ -d $LINUX ] || die "/data/linux does not exist - install an OS first"
+
+# ---------------------------------------------------------------- config
+DEFAULT=
+TIMEOUT=4
+[ -f $LINUX/boot.conf ] && . $LINUX/boot.conf 2>>$LOG
+
+# Collect bootable systems: directories with an init, sorted by name.
+OSES=
+for d in $LINUX/*/; do
+	d=${d%/}; n=${d##*/}
+	case "$n" in .*|lost+found) continue;; esac
+	if [ -e "$d/sbin/init" ] || [ -L "$d/sbin/init" ] || [ -f "$LINUX/$n.conf" ]; then
+		OSES="$OSES $n"
+	fi
+done
+OSES=${OSES# }
+[ -n "$OSES" ] || die "no OS found under /data/linux"
+set -- $OSES
+COUNT=$#
+[ -n "$DEFAULT" ] && case " $OSES " in *" $DEFAULT "*) ;; *) DEFAULT=;; esac
+[ -n "$DEFAULT" ] || DEFAULT=$1
+
+# ---------------------------------------------------------------- menu
+# Reads gpio-keys + cpcap power button through the evdev interface.
+# struct input_event on 32-bit ARM: sec(4) usec(4) type(2) code(2) value(4)
+KEYFIFO=/run/keys
+KEYPIDS=
+start_keys() {
+	mkfifo $KEYFIFO
+	for e in /dev/input/event*; do
+		[ -c "$e" ] || continue
+		# One hexdump per event so every key press is flushed immediately
+		# (hexdump block-buffers when writing to a pipe).
+		( exec < "$e"
+		  while :; do
+			dd bs=16 count=1 2>/dev/null | \
+				hexdump -v -e '2/4 "%u " 2/2 " %u" 1/4 " %d" "\n"' || break
+		  done ) > $KEYFIFO &
+		KEYPIDS="$KEYPIDS $!"
+	done
+	exec 3<>$KEYFIFO
+}
+stop_keys() {
+	for p in $KEYPIDS; do kill $p 2>/dev/null; done
+	exec 3<&-
+}
+
+draw_menu() {
+	{
+		printf '\033[2J\033[H'
+		echo "  NuraXoom boot - $KREL"
+		echo
+		idx=0
+		for o in $OSES; do
+			if [ "$o" = "$SEL" ]; then echo "   > $o"; else echo "     $o"; fi
+		done
+		if [ "$SEL" = "@poweroff" ]; then echo "   > Power off"; else echo "     Power off"; fi
+		echo
+		echo "  Vol Down: next   Vol Up: boot   ($REMAIN s)"
+	} > $TTY 2>/dev/null
+}
+
+next_entry() {
+	found=0
+	for o in $OSES @poweroff; do
+		if [ $found = 1 ]; then SEL=$o; return; fi
+		[ "$o" = "$SEL" ] && found=1
+	done
+	set -- $OSES; SEL=$1
+}
+
+SEL=$DEFAULT
+if [ "$TIMEOUT" -gt 0 ] 2>/dev/null; then
+	start_keys
+	REMAIN=$TIMEOUT
+	TOUCHED=0
+	draw_menu
+	while [ $REMAIN -gt 0 ] || [ $TOUCHED = 1 ]; do
+		if read -t 1 -u 3 sec usec type code value 2>/dev/null; then
+			[ "$type" = 1 ] && [ "$value" = 1 ] || continue
+			TOUCHED=1
+			case "$code" in
+				114) next_entry; draw_menu ;;     # KEY_VOLUMEDOWN
+				115|116) break ;;                 # KEY_VOLUMEUP / KEY_POWER
+			esac
+		else
+			[ $TOUCHED = 1 ] && continue
+			REMAIN=$((REMAIN - 1)); draw_menu
+		fi
+	done
+	stop_keys
+fi
+printf '\033[2J\033[H' > $TTY 2>/dev/null
+
+if [ "$SEL" = "@poweroff" ]; then
+	umount $DATA; sync; poweroff -f
+fi
+
+# ---------------------------------------------------------------- boot it
+OS=$SEL
+ROOT=$LINUX/$OS
+INIT=/sbin/init
+CMDLINE_INIT_ARGS=
+[ -f "$LINUX/$OS.conf" ] && . "$LINUX/$OS.conf" 2>>$LOG
+say "booting $OS from /data/linux/$OS ($INIT)"
+[ -d "$ROOT" ] || die "$ROOT is missing"
+
+mount --bind "$ROOT" $NEWROOT || die "cannot bind $ROOT"
+[ -e "$NEWROOT$INIT" ] || [ -L "$NEWROOT$INIT" ] || die "$OS has no $INIT"
+
+# Shared kernel modules/firmware for distributions that do not ship our kernel.
+for kind in modules firmware; do
+	src=$LINUX/.kernel/$kind
+	[ -d "$src" ] || continue
+	if [ $kind = modules ]; then
+		[ -d "$src/$KREL" ] || continue
+		dst=$NEWROOT/lib/modules/$KREL
+		[ -d "$dst" ] && [ -n "$(ls "$dst" 2>/dev/null)" ] && continue
+		mkdir -p "$dst" && mount --bind "$src/$KREL" "$dst"
+	else
+		dst=$NEWROOT/lib/firmware/nuraxoom
+		mkdir -p "$dst" && mount --bind "$src" "$dst"
+	fi
+done
+
+# Give the OS access to the rest of userdata (Android /sdcard lives in media/0).
+mkdir -p $NEWROOT/mnt/userdata 2>/dev/null
+save_logs
+for m in dev proc sys run; do
+	mkdir -p $NEWROOT/$m
+	mount --move /$m $NEWROOT/$m || die "cannot move /$m"
+done
+mount --move $DATA $NEWROOT/mnt/userdata || die "cannot move userdata"
+
+exec switch_root $NEWROOT $INIT $CMDLINE_INIT_ARGS
+die "switch_root failed"

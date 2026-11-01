@@ -1,0 +1,44 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index e9486d7..6f5de43 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -46,7 +46,7 @@ opentegra_drv_la_CFLAGS += -pthread
+ opentegra_drv_la_CFLAGS += -I$(srcdir)/tegradrm
+ 
+ # enable fp16 for the 3d vertex attributes
+-opentegra_drv_la_CFLAGS += -mfp16-format=ieee
++# clang: IEEE __fp16 by default
+ 
+ opentegra_drv_la_SOURCES = \
+ 	compat-api.h \
+diff --git a/src/tegradrm/uapi_v3/strlcpy.c b/src/tegradrm/uapi_v3/strlcpy.c
+index fd7e653..f94d04b 100644
+--- a/src/tegradrm/uapi_v3/strlcpy.c
++++ b/src/tegradrm/uapi_v3/strlcpy.c
+@@ -16,6 +16,7 @@
+  */
+ #include <sys/types.h>
+ #include <string.h>
++#define strlcpy opentegra_strlcpy
+ /*
+  * Copy src to string dst of size siz.  At most siz-1 characters
+  * will be copied.  Always NUL terminates (unless siz == 0).
+diff --git a/src/tegradrm/uapi_v3/sync.h b/src/tegradrm/uapi_v3/sync.h
+index 76fa733..262c464 100644
+--- a/src/tegradrm/uapi_v3/sync.h
++++ b/src/tegradrm/uapi_v3/sync.h
+@@ -23,7 +23,13 @@
+ #ifndef ANDROID_SYNC_H
+ #define ANDROID_SYNC_H
+ #include <stdint.h>
+-#include <sys/cdefs.h>
++#ifdef __cplusplus
++#define __BEGIN_DECLS extern "C" {
++#define __END_DECLS }
++#else
++#define __BEGIN_DECLS
++#define __END_DECLS
++#endif
+ #include "sync_file.h"
+ 
+ /* Fences indicate the status of an asynchronous task. They are initially

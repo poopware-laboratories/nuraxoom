@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Select the Xorg driver used by the Sxmo session.
+S=/var/lib/nuraxoom
+case "$1" in
+status|"")
+	echo "configured: $(grep -v '^#' /etc/nuraxoom/display | head -n1)"
+	echo "opentegra tries: $(cat $S/opentegra-tries 2>/dev/null || echo 0)"
+	[ -e $S/opentegra-ok ] && echo "opentegra: worked before"
+	exit 0 ;;
+auto|opentegra|modesetting) ;;
+*) echo "usage: nuraxoom-display [status|auto|opentegra|modesetting]" >&2; exit 2 ;;
+esac
+[ "$(id -u)" = 0 ] || exec doas /usr/bin/nuraxoom-display "$@"
+sed -i "s/^[a-z]*$/$1/" /etc/nuraxoom/display
+rm -f $S/opentegra-tries $S/opentegra-ok
+echo "Xorg driver set to $1; reboot to apply (a session restart leaves the old X server running)."

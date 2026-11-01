@@ -1,0 +1,1 @@
+sxmo_deviceprofile_motorola,wingray.sh

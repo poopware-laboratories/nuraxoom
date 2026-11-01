@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Login prompt on the USB serial console (nuraxoom-usb). Run by inittab; waits
+# for the gadget to create /dev/ttyGS0 instead of respawning in a tight loop.
+while [ ! -c /dev/ttyGS0 ]; do sleep 5; done
+exec /sbin/getty -L 115200 ttyGS0 vt100

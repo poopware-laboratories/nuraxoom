@@ -1,0 +1,9 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Mirror boot/session logs to /sdcard/NuraXoom/logs every 30s, so problems
+# can be read from TWRP (File Manager) without a USB cable.
+description="Copy logs to /sdcard/NuraXoom/logs"
+command=/usr/libexec/nuraxoom/logs-loop
+command_background=yes
+pidfile=/run/nuraxoom-logs.pid
+depend() { need localmount; }

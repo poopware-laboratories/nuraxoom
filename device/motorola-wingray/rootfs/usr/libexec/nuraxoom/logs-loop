@@ -1,0 +1,36 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+OUT=/mnt/userdata/media/0/NuraXoom/logs
+[ -d /mnt/userdata/media/0 ] || exit 0
+mkdir -p $OUT
+snap() {
+	dmesg > $OUT/dmesg.txt 2>&1
+	cp /var/log/messages $OUT/messages.txt 2>/dev/null
+	cp /var/log/rc.log $OUT/rc.log 2>/dev/null
+	rc-status -a > $OUT/rc-status.txt 2>&1
+	{ ip addr; echo; cat /etc/resolv.conf; echo; wpa_cli -i wlan0 status 2>&1; } > $OUT/network.txt 2>&1
+	for h in /home/*; do
+		u=${h##*/}
+		cp $h/.local/state/tinydm.log $OUT/tinydm-$u.log 2>/dev/null
+		cp $h/.local/share/xorg/Xorg.0.log $OUT/Xorg-$u.log 2>/dev/null
+		cp $h/.local/state/sxmo.log $OUT/sxmo-$u.log 2>/dev/null
+	done
+	cp /var/log/Xorg.0.log $OUT/Xorg-root.log 2>/dev/null
+	{ lsmod; echo; grep -H . /sys/class/power_supply/*/* 2>/dev/null; } > $OUT/power.txt 2>&1
+	{ cat /proc/bus/input/devices; ls -l /dev/input /dev/uinput; echo; ps -o pid,user,args | grep -E '[f]bkeyboard|[l]ogin|[g]etty'; echo; cat /run/fbkeyboard.log; } > $OUT/input.txt 2>&1
+	{
+		echo "== $(cat /proc/device-tree/model 2>/dev/null) / $(uname -r)"; uptime
+		echo; echo "== sound"; aplay -l; amixer -c 0 scontrols; amixer -c 0 scontents
+		echo; echo "== gpu"; ls -l /dev/dri; dmesg | grep -i -E 'host1x|gr2d|gr3d|tegra-dc|drm'
+		cat /etc/nuraxoom/display; grep -h -i -E 'LoadModule|driver|exa|glamor|\(EE\)' /home/*/.local/share/xorg/Xorg.0.log 2>/dev/null | head -40
+		echo; echo "== wifi/bt"; dmesg | grep -i -E 'brcm|bcm43|bluetooth|hci'
+		echo; echo "== input"; dmesg | grep -i -E 'cpcap|pwrbutton|gpio-keys|maxtouch|mxt'
+		echo; echo "== sensors"; for d in /sys/bus/iio/devices/*; do echo "$d $(cat $d/name 2>/dev/null)"; done
+		echo; echo "== power"; ls /sys/class/power_supply /sys/class/backlight /sys/class/udc
+		echo; echo "== usb"; ip addr show usb0; cat /sys/kernel/config/usb_gadget/nuraxoom/UDC
+	} > $OUT/diag.txt 2>&1
+	sync
+}
+snap
+# Rotate on first run of a boot: keep the previous boot's set.
+while :; do sleep 30; snap; done

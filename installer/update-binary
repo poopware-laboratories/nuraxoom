@@ -1,0 +1,231 @@
+#!/sbin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# NuraXoom TWRP installer - Motorola Xoom (wingray)
+#
+# * saves the current boot partition to /sdcard/NuraXoom/backup/ (first)
+# * installs Nura into /data/linux/nura (keeps /home and Wi-Fi on upgrade)
+# * installs shared kernel modules into /data/linux/.kernel
+# * writes boot.img (xoomboot) to the boot partition, verified by readback
+#
+# Never formats, never repartitions, never touches system/recovery/Android data.
+
+OUTFD=$2
+ZIP=$3
+NX_VERSION=@VERSION@
+OS=nura
+
+ui() { echo "ui_print $*" >&"$OUTFD"; echo "ui_print" >&"$OUTFD"; }
+progress() { echo "set_progress $1" >&"$OUTFD"; }
+abort() { ui " "; ui "!! $*"; ui "!! Nothing was written to the boot partition."; cleanup; exit 1; }
+
+T=/tmp/nuraxoom
+cleanup() { cd /; rm -rf "$T"; }
+
+ui "=========================================="
+ui " NuraXoom $NX_VERSION - Nura for Motorola Xoom"
+ui " community device port (not an official Nura release)"
+ui "=========================================="
+
+# ------------------------------------------------------------- device check
+prop() {
+	v=$(getprop "$1" 2>/dev/null)
+	# Some recoveries have no getprop in the updater's PATH: read the files.
+	for f in /default.prop /prop.default /system/build.prop /system/system/build.prop; do
+		[ -n "$v" ] && break
+		[ -f "$f" ] && v=$(sed -n "s/^$1=//p" "$f" | head -n1)
+	done
+	echo "$v"
+}
+dev=$(prop ro.product.device)
+[ -n "$dev" ] || dev=$(prop ro.build.product)
+# Motorola's Xoom kernels report "Hardware : Stingray"; mainline says NVIDIA Tegra.
+hw=$(sed -n 's/^Hardware[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n1)
+case "$dev" in
+	wingray|stingray|everest|umts_everest|hubble|umts_hubble|xoom|Xoom|MZ60*) ;;
+	*)
+		case "$hw" in
+			*[Ss]tingray*|*[Ww]ingray*|*[Tt]egra*)
+				ui "! recovery reports device '$dev', hardware '$hw'; continuing" ;;
+			*)
+				abort "this zip is only for the Motorola Xoom (device: '$dev', hardware: '$hw')" ;;
+		esac ;;
+esac
+
+# ------------------------------------------------------------- tools
+rm -rf "$T"; mkdir -p "$T" || abort "cannot create $T"
+unzip -o -q "$ZIP" 'nuraxoom/busybox' 'nuraxoom/SHA256SUMS' 'nuraxoom/boot.img' \
+	'nuraxoom/wifi.txt.example' -d "$T" || abort "cannot read the zip"
+BB=$T/nuraxoom/busybox
+chmod 755 "$BB"
+"$BB" true || abort "bundled busybox does not run"
+bb() { "$BB" "$@"; }
+
+# ------------------------------------------------------------- partitions
+find_part() {
+	p=/dev/block/platform/sdhci-tegra.3/by-name/$1
+	[ -b "$p" ] && { echo "$p"; return 0; }
+	for u in /sys/class/block/*/uevent; do
+		bb grep -q "^PARTNAME=$1\$" "$u" 2>/dev/null || continue
+		n=$(bb sed -n 's/^DEVNAME=//p' "$u")
+		[ -b "/dev/block/$n" ] && { echo "/dev/block/$n"; return 0; }
+	done
+	# Last resort: the recovery's own fstab (old "/boot emmc /dev/..." or
+	# new "/dev/... /boot emmc" layout).
+	case $1 in boot) mp=/boot ;; userdata) mp=/data ;; system) mp=/system ;; *) return 1 ;; esac
+	for f in /etc/recovery.fstab /etc/twrp.fstab /etc/fstab /fstab.*; do
+		[ -f "$f" ] || continue
+		p=$(bb awk -v mp="$mp" '$1 !~ /^#/ {
+			if ($1 == mp && $3 ~ /^\/dev\//) { print $3; exit }
+			if ($2 == mp && $1 ~ /^\/dev\//) { print $1; exit } }' "$f")
+		[ -b "$p" ] && { echo "$p"; return 0; }
+	done
+	return 1
+}
+BOOT=$(find_part boot) || abort "boot partition not found"
+USERDATA=$(find_part userdata) || abort "userdata partition not found"
+ui "boot:     $BOOT"
+ui "userdata: $USERDATA"
+
+# ------------------------------------------------------------- /data
+if ! bb grep -q ' /data ' /proc/mounts; then
+	mount /data 2>/dev/null || bb mount -t ext4 "$USERDATA" /data || abort "cannot mount /data"
+fi
+fstype=$(bb awk '$2=="/data"{print $3; exit}' /proc/mounts)
+[ "$fstype" = ext4 ] || abort "/data is $fstype, expected ext4"
+[ -d /data/media/0 ] && SD=/data/media/0 || SD=/data/media
+NX=$SD/NuraXoom
+bb mkdir -p "$NX/backup" "$NX/logs" || abort "cannot create $NX"
+
+# BusyBox df puts a long device name (by-name/userdata) on a line of its own,
+# so take "available" counting from the end of the last line.
+free_kb=$(bb df -Pk /data | bb awk 'END{print $(NF-2)}')
+case "$free_kb" in ''|*[!0-9]*) free_kb= ;; esac
+if [ -z "$free_kb" ]; then
+	ui "! could not read free space on /data; continuing"
+else
+	ui "free space on /data: $((free_kb / 1024)) MiB"
+	[ "$free_kb" -gt 2097152 ] || abort "need at least 2 GiB free on /data"
+fi
+
+# ------------------------------------------------------------- verify payload
+ui "Verifying payload checksums (this reads the whole zip)..."
+progress 0.05
+cd "$T/nuraxoom" || abort "payload missing"
+while read -r sum name; do
+	case "$name" in boot.img) got=$(bb sha256sum boot.img | bb cut -d' ' -f1) ;;
+	*) got=$(bb unzip -p "$ZIP" "nuraxoom/$name" | bb sha256sum | bb cut -d' ' -f1) ;;
+	esac
+	[ "$got" = "$sum" ] || abort "checksum mismatch: $name (re-copy the zip)"
+	ui "  ok  $name"
+done < SHA256SUMS
+cd /
+progress 0.15
+
+# ------------------------------------------------------------- backup boot
+stamp=$(bb date +%Y%m%d-%H%M%S)
+if [ ! -f "$NX/backup/boot-original.img" ]; then
+	bb dd if="$BOOT" of="$NX/backup/boot-original.img" bs=1M 2>/dev/null || abort "boot backup failed"
+	(cd "$NX/backup" && bb sha256sum boot-original.img > boot-original.img.sha256)
+	ui "Saved original boot to /sdcard/NuraXoom/backup/boot-original.img"
+fi
+bb dd if="$BOOT" of="$NX/backup/boot-before-$stamp.img" bs=1M 2>/dev/null || abort "boot backup failed"
+(cd "$NX/backup" && bb sha256sum "boot-before-$stamp.img" > "boot-before-$stamp.img.sha256")
+ui "Saved current boot to /sdcard/NuraXoom/backup/boot-before-$stamp.img"
+bb sync
+
+# ------------------------------------------------------------- install rootfs
+L=/data/linux
+bb mkdir -p "$L"
+NEW=$L/.$OS.new
+OLD=$L/.$OS.old
+bb rm -rf "$NEW"
+bb mkdir -p "$NEW"
+ui "Installing Nura into /data/linux/$OS (several minutes)..."
+progress 0.2
+bb unzip -p "$ZIP" nuraxoom/nura-rootfs.tar.gz | bb tar -xzf - -C "$NEW" 2>"$T/tar.err"
+st=$?
+if [ $st -ne 0 ] || [ ! -e "$NEW/sbin/init" -a ! -L "$NEW/sbin/init" ]; then
+	bb tail -n 5 "$T/tar.err" | while read -r l; do ui "  $l"; done
+	bb rm -rf "$NEW"
+	abort "rootfs extraction failed"
+fi
+progress 0.75
+
+# Bluetooth patch firmware is Motorola's and not redistributed: take it from
+# this tablet's own Android system partition (read-only). The wingray file
+# works on the MZ605 too; the MZ605 stock one stops the chip answering.
+SYSTEM=$(find_part system 2>/dev/null)
+S=$T/system
+bb mkdir -p "$S"
+if [ -n "$SYSTEM" ] && bb mount -o ro -t ext4 "$SYSTEM" "$S" 2>/dev/null; then
+	if [ -f "$S/etc/firmware/bcm4329.hcd" ]; then
+		for b in wingray mz605; do
+			bb cp "$S/etc/firmware/bcm4329.hcd" "$NEW/usr/lib/firmware/brcm/BCM4329B1.motorola,$b.hcd"
+		done
+		ui "Bluetooth firmware copied from the Android system partition"
+	else
+		ui "! no /system/etc/firmware/bcm4329.hcd: Bluetooth will not work"
+	fi
+	bb umount "$S"
+else
+	ui "! could not mount the Android system partition: Bluetooth will not work"
+fi
+
+if [ -d "$L/$OS" ]; then
+	ui "Existing install found: keeping /home, Wi-Fi networks and SSH keys"
+	bb rm -rf "$NEW/home"
+	bb mv "$L/$OS/home" "$NEW/home" 2>/dev/null
+	for f in etc/wpa_supplicant/wpa_supplicant.conf etc/nuraxoom/display; do
+		[ -f "$L/$OS/$f" ] && bb cp -a "$L/$OS/$f" "$NEW/$f"
+	done
+	bb cp -a "$L/$OS"/etc/NetworkManager/system-connections/. \
+		"$NEW/etc/NetworkManager/system-connections/" 2>/dev/null
+	# Before 0.4.0 the Wi-Fi status hook talked to wpa_supplicant directly; with
+	# NetworkManager Sxmo's own hook is the right one.
+	for h in "$NEW"/home/*/.config/sxmo/hooks/sxmo_hook_statusbar.sh; do
+		bb grep -q set_wifi_wpa "$h" 2>/dev/null && bb mv "$h" "$h.pre-0.4"
+	done
+	bb cp -a "$L/$OS"/etc/ssh/ssh_host_* "$NEW/etc/ssh/" 2>/dev/null
+	bb rm -rf "$OLD"
+	bb mv "$L/$OS" "$OLD"
+fi
+bb mv "$NEW" "$L/$OS" || abort "cannot move new root into place"
+bb rm -rf "$OLD"
+
+# Shared kernel modules for other distributions in /data/linux/<name>
+KREL=$(bb cat "$L/$OS/usr/share/nuraxoom/kernel.release")
+bb rm -rf "$L/.kernel/modules"
+bb mkdir -p "$L/.kernel/modules"
+bb cp -a "$L/$OS/usr/lib/modules/$KREL" "$L/.kernel/modules/"
+[ -f "$L/boot.conf" ] || printf '%s\n' \
+	'# xoomboot settings. Each OS lives in /data/linux/<name>/.' \
+	"DEFAULT=$OS" 'TIMEOUT=3' > "$L/boot.conf"
+[ -f "$NX/wifi.txt" ] || [ -f "$NX/wifi.txt.imported" ] || \
+	bb cp "$T/nuraxoom/wifi.txt.example" "$NX/wifi.txt.example"
+chown -R 1023:1023 "$NX" 2>/dev/null
+bb sync
+progress 0.9
+
+# ------------------------------------------------------------- boot image
+img=$T/nuraxoom/boot.img
+size=$(bb wc -c < "$img")
+psize=$(( $(bb cat /sys/class/block/$(bb basename $(bb readlink -f "$BOOT"))/size) * 512 ))
+[ "$size" -lt "$psize" ] || abort "boot.img ($size) larger than boot partition ($psize)"
+ui "Writing xoomboot to the boot partition..."
+bb dd if="$img" of="$BOOT" bs=1M 2>/dev/null || abort "boot write failed - restore with NuraXoom-restore-boot.zip"
+bb sync
+want=$(bb sha256sum "$img" | bb cut -d' ' -f1)
+got=$(bb head -c "$size" "$BOOT" | bb sha256sum | bb cut -d' ' -f1)
+[ "$want" = "$got" ] || ui "!! boot readback mismatch - flash NuraXoom-restore-boot.zip before rebooting"
+progress 1.0
+
+ui " "
+ui "Done. Nura is in /data/linux/$OS."
+ui "Login user: user   password: 147147   (change it with: passwd)"
+ui "Wi-Fi: put 'SSID<TAB>password' lines in /sdcard/NuraXoom/wifi.txt"
+ui "       before rebooting, or use Sxmo > Scripts > Wi-Fi."
+ui "Logs:  /sdcard/NuraXoom/logs   Undo: NuraXoom-restore-boot.zip"
+ui "Reboot > System."
+cleanup
+exit 0

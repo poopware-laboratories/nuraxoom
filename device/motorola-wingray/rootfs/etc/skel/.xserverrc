@@ -1,0 +1,6 @@
+#!/bin/sh
+# NuraXoom: Alpine's setuid Xorg.wrap starts Xorg with an empty environment, so
+# XORGCONFIG (set by /etc/tinydm.d/env-x11.d/90-nuraxoom-display) never arrives.
+# Pass it as -config instead (relative names are allowed for privileged Xorg
+# and resolve to /etc/X11/nuraxoom-*.conf).
+exec /usr/bin/X -nolisten tcp ${XORGCONFIG:+-config "$XORGCONFIG"} "$@"

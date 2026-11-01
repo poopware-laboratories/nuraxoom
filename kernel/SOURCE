@@ -1,0 +1,3 @@
+# Kernel source pin (sourced by scripts/build-kernel.sh and CI).
+KERNEL_REPO=https://github.com/xoom-linux/linux
+KERNEL_COMMIT=2404d27378503b4df74ab2cb0a8b7cd6cf9d5fc3

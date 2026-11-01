@@ -1,0 +1,10 @@
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+tty1::respawn:/usr/libexec/nuraxoom/console-session
+tty2::respawn:/sbin/getty 38400 tty2
+tty3::respawn:/sbin/getty 38400 tty3
+# USB serial console (nuraxoom-usb); waits for /dev/ttyGS0
+::respawn:/usr/libexec/nuraxoom/usb-getty
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

@@ -1,0 +1,39 @@
+#!/sbin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# NuraXoom: save the kernel crash log (ramoops) of the last Linux boot.
+# Flash in TWRP right after a crash/reboot loop, before powering off: the
+# log lives in RAM at 0x1fe00000, which the Motorola/TWRP kernel never uses.
+# Writes /sdcard/NuraXoom/logs/ramoops-<time>.bin and a readable .txt.
+# Reads memory only; writes nothing but those two files.
+OUTFD=$2
+ZIP=$3
+ui() { echo "ui_print $*" >&"$OUTFD"; echo "ui_print" >&"$OUTFD"; }
+abort() { ui "!! $*"; exit 1; }
+ui "NuraXoom - save Linux crash log"
+mkdir -p /tmp/nxc && unzip -o -q "$ZIP" nuraxoom/busybox -d /tmp/nxc && chmod 755 /tmp/nxc/nuraxoom/busybox || abort "cannot unpack busybox"
+bb() { /tmp/nxc/nuraxoom/busybox "$@"; }
+grep -q ' /data ' /proc/mounts || mount /data || abort "cannot mount /data"
+[ -d /data/media/0 ] && SD=/data/media/0 || SD=/data/media
+L=$SD/NuraXoom/logs
+bb mkdir -p "$L" || abort "cannot create $L"
+[ -c /dev/mem ] || bb mknod /dev/mem c 1 1 2>/dev/null
+stamp=$(bb date +%Y%m%d-%H%M%S)
+BIN=$L/ramoops-$stamp.bin
+TXT=$L/ramoops-$stamp.txt
+# 0x1fe00000 / 4096 = 130560 pages, 1 MiB = 256 pages
+bb dd if=/dev/mem of="$BIN" bs=4096 skip=130560 count=256 2>/dev/null || abort "cannot read /dev/mem (recovery kernel blocks it)"
+[ "$(bb wc -c < "$BIN")" = 1048576 ] || abort "short read from /dev/mem"
+# Console record: last 256 KiB before the 128 KiB pmsg zone (offset 0xa0000).
+bb dd if="$BIN" bs=4096 skip=160 count=64 2>/dev/null | bb strings -n 6 > "$TXT"
+n=$(bb wc -l < "$TXT")
+ui "saved $BIN"
+ui "      $TXT ($n lines)"
+if [ "$n" -gt 0 ]; then
+	ui "last lines:"
+	bb tail -n 12 "$TXT" | bb cut -c1-60 | while IFS= read -r l; do ui "  $l"; done
+else
+	ui "no text found (RAM was cleared, or Linux never got that far)"
+fi
+chown -R 1023:1023 "$SD/NuraXoom" 2>/dev/null
+bb sync
+exit 0

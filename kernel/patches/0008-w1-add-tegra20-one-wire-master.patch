@@ -1,0 +1,377 @@
+diff --git a/drivers/w1/masters/Kconfig b/drivers/w1/masters/Kconfig
+index e6049a75b..1a2339446 100644
+--- a/drivers/w1/masters/Kconfig
++++ b/drivers/w1/masters/Kconfig
+@@ -52,6 +52,13 @@ config W1_MASTER_MXC
+ 	help
+ 	  Say Y here to enable MXC 1-wire host
+ 
++config W1_MASTER_TEGRA
++	tristate "NVIDIA Tegra20 one-wire (OWR) bus master"
++	depends on ARCH_TEGRA_2x_SOC || COMPILE_TEST
++	help
++	  One-wire controller of the Tegra20 SoC. The Motorola Xoom reads the
++	  DS2781 fuel gauge in its battery pack through it.
++
+ config W1_MASTER_GPIO
+ 	tristate "GPIO 1-wire busmaster"
+ 	depends on GPIOLIB || COMPILE_TEST
+diff --git a/drivers/w1/masters/Makefile b/drivers/w1/masters/Makefile
+index 227f80987..b1d123e24 100644
+--- a/drivers/w1/masters/Makefile
++++ b/drivers/w1/masters/Makefile
+@@ -13,3 +13,4 @@ obj-$(CONFIG_W1_MASTER_GPIO)		+= w1-gpio.o
+ obj-$(CONFIG_HDQ_MASTER_OMAP)		+= omap_hdq.o
+ obj-$(CONFIG_W1_MASTER_SGI)		+= sgi_w1.o
+ obj-$(CONFIG_W1_MASTER_UART)		+= w1-uart.o
++obj-$(CONFIG_W1_MASTER_TEGRA)	+= tegra_w1.o
+diff --git a/drivers/w1/masters/tegra_w1.c b/drivers/w1/masters/tegra_w1.c
+new file mode 100644
+index 000000000..f71152172
+--- /dev/null
++++ b/drivers/w1/masters/tegra_w1.c
+@@ -0,0 +1,344 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * NVIDIA Tegra20 one-wire (OWR) bus master.
++ *
++ * Copyright (C) 2010 Motorola, Inc
++ * Author: Andrei Warkentin <andreiw@motorola.com>
++ *
++ * Ported from the Motorola Stingray (Xoom) 2.6.39 kernel to the device tree
++ * and the current w1 core for the NuraXoom community port. Register usage and
++ * the board timings are Motorola's; the Xoom battery pack carries a DS2781
++ * fuel gauge on this bus.
++ */
++
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++#include <linux/spinlock.h>
++#include <linux/w1.h>
++
++#define OWR_CONTROL		0x0
++#define OC_RD_BIT		BIT(31)
++#define OC_WR0_BIT		BIT(30)
++#define OC_RD_SCLK_SHIFT	23
++#define OC_RD_SCLK_MASK		0xf
++#define OC_P_SCLK_SHIFT		15
++#define OC_P_SCLK_MASK		0xff
++#define OC_BIT_XMODE		BIT(2)
++#define OC_GO			BIT(0)
++
++#define OWR_WR_RD_TCTL		0xc
++#define ORWT_TSU_SHIFT		28
++#define ORWT_TSU_MASK		0x3
++#define ORWT_TRELEASE_SHIFT	22
++#define ORWT_TRELEASE_MASK	0x3f
++#define ORWT_TRDV_SHIFT		18
++#define ORWT_TRDV_MASK		0xf
++#define ORWT_TLOW0_SHIFT	11
++#define ORWT_TLOW0_MASK		0x7f
++#define ORWT_TLOW1_SHIFT	7
++#define ORWT_TLOW1_MASK		0xf
++#define ORWT_TSLOT_SHIFT	0
++#define ORWT_TSLOT_MASK		0x7f
++
++#define OWR_RST_PRES_TCTL	0x10
++#define ORPT_TPDL_SHIFT		24
++#define ORPT_TPDL_MASK		0xff
++#define ORPT_TPDH_SHIFT		18
++#define ORPT_TPDH_MASK		0x3f
++#define ORPT_TRSTL_SHIFT	9
++#define ORPT_TRSTL_MASK		0x1ff
++#define ORPT_TRSTH_SHIFT	0
++#define ORPT_TRSTH_MASK		0x1ff
++
++#define OWR_INTR_MASK		0x24
++#define OI_BIT_XFER_DONE	BIT(13)
++#define OI_PRESENCE_DONE	BIT(5)
++#define OI_PRESENCE_ERR		BIT(0)
++
++#define OWR_INTR_STATUS		0x28
++
++#define OWR_STATUS		0x34
++#define OS_READ_BIT_SHIFT	23
++
++#define BIT_XFER_TIMEOUT_MS	5000
++#define BIT_XFER_ERRORS		OI_PRESENCE_ERR
++/* OWR requires a 1 MHz clock */
++#define OWR_CLOCK		1000000
++
++/* In OWR clocks, from Motorola board-stingray.c tegra_w1_platform_timings */
++struct tegra_w1_timings {
++	u32 tsu, trelease, trdv, tlow0, tlow1, tslot;
++	u32 tpdl, tpdh, trstl, trsth;
++	u32 rdsclk, psclk;
++};
++
++static const struct tegra_w1_timings tegra20_w1_timings = {
++	.tsu = 0x1, .trelease = 0xf, .trdv = 0xf,
++	.tlow0 = 0x3c, .tlow1 = 0x1, .tslot = 0x78,
++	.tpdl = 0x3c, .tpdh = 0x1e, .trstl = 0x1ea, .trsth = 0x1df,
++	.rdsclk = 0x7, .psclk = 0x50,
++};
++
++struct tegra_w1 {
++	struct w1_bus_master bus_master;
++	struct device *dev;
++	void __iomem *base;
++	struct clk *clk;
++	const struct tegra_w1_timings *timings;
++	struct completion *transfer_completion;
++	u32 intr_status;
++	spinlock_t lock;	/* intr_status, transfer_completion */
++	struct mutex mutex;	/* one bus operation at a time */
++};
++
++static inline u32 owr_readl(struct tegra_w1 *w1, unsigned int reg)
++{
++	return readl(w1->base + reg);
++}
++
++static inline void owr_writel(struct tegra_w1 *w1, u32 val, unsigned int reg)
++{
++	writel(val, w1->base + reg);
++}
++
++static int owr_wait(struct tegra_w1 *w1, struct completion *done, u32 mask)
++{
++	unsigned long flags;
++	u32 status;
++
++	if (!wait_for_completion_timeout(done, msecs_to_jiffies(BIT_XFER_TIMEOUT_MS))) {
++		dev_dbg(w1->dev, "timeout\n");
++		return -ETIMEDOUT;
++	}
++
++	spin_lock_irqsave(&w1->lock, flags);
++	status = w1->intr_status;
++	w1->intr_status = 0;
++	spin_unlock_irqrestore(&w1->lock, flags);
++
++	if ((status & BIT_XFER_ERRORS) || !(status & mask))
++		return -EIO;
++	return 0;
++}
++
++static void owr_setup(struct tegra_w1 *w1)
++{
++	const struct tegra_w1_timings *t = w1->timings;
++
++	owr_writel(w1, ((t->tslot & ORWT_TSLOT_MASK) << ORWT_TSLOT_SHIFT) |
++		   ((t->tlow1 & ORWT_TLOW1_MASK) << ORWT_TLOW1_SHIFT) |
++		   ((t->tlow0 & ORWT_TLOW0_MASK) << ORWT_TLOW0_SHIFT) |
++		   ((t->trdv & ORWT_TRDV_MASK) << ORWT_TRDV_SHIFT) |
++		   ((t->trelease & ORWT_TRELEASE_MASK) << ORWT_TRELEASE_SHIFT) |
++		   ((t->tsu & ORWT_TSU_MASK) << ORWT_TSU_SHIFT), OWR_WR_RD_TCTL);
++
++	owr_writel(w1, ((t->trsth & ORPT_TRSTH_MASK) << ORPT_TRSTH_SHIFT) |
++		   ((t->trstl & ORPT_TRSTL_MASK) << ORPT_TRSTL_SHIFT) |
++		   ((t->tpdh & ORPT_TPDH_MASK) << ORPT_TPDH_SHIFT) |
++		   ((t->tpdl & ORPT_TPDL_MASK) << ORPT_TPDL_SHIFT), OWR_RST_PRES_TCTL);
++
++	/* Clear interrupt mask and status in case anything is pending */
++	owr_writel(w1, 0, OWR_INTR_MASK);
++	owr_writel(w1, 0xffffffff, OWR_INTR_STATUS);
++}
++
++static irqreturn_t tegra_w1_irq(int irq, void *data)
++{
++	struct tegra_w1 *w1 = data;
++	unsigned long flags;
++	u32 status;
++
++	status = owr_readl(w1, OWR_INTR_STATUS);
++	if (!status)
++		return IRQ_NONE;
++
++	spin_lock_irqsave(&w1->lock, flags);
++	owr_writel(w1, status, OWR_INTR_STATUS);
++	if (w1->transfer_completion) {
++		w1->intr_status = status;
++		complete(w1->transfer_completion);
++	} else {
++		dev_dbg(w1->dev, "spurious interrupt, status 0x%x\n", status);
++	}
++	spin_unlock_irqrestore(&w1->lock, flags);
++
++	return IRQ_HANDLED;
++}
++
++static u32 owr_control(struct tegra_w1 *w1)
++{
++	const struct tegra_w1_timings *t = w1->timings;
++
++	return ((t->rdsclk & OC_RD_SCLK_MASK) << OC_RD_SCLK_SHIFT) |
++	       ((t->psclk & OC_P_SCLK_MASK) << OC_P_SCLK_SHIFT) | OC_BIT_XMODE;
++}
++
++static void owr_begin(struct tegra_w1 *w1, struct completion *done, u32 mask)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&w1->lock, flags);
++	w1->intr_status = 0;
++	w1->transfer_completion = done;
++	spin_unlock_irqrestore(&w1->lock, flags);
++	owr_writel(w1, mask, OWR_INTR_MASK);
++}
++
++static void owr_end(struct tegra_w1 *w1)
++{
++	unsigned long flags;
++
++	owr_writel(w1, 0, OWR_INTR_MASK);
++	spin_lock_irqsave(&w1->lock, flags);
++	w1->transfer_completion = NULL;
++	spin_unlock_irqrestore(&w1->lock, flags);
++}
++
++/* Write-0 cycle if bit == 0, otherwise a read cycle (which writes a 1). */
++static u8 tegra_w1_touch_bit(void *data, u8 bit)
++{
++	struct tegra_w1 *w1 = data;
++	DECLARE_COMPLETION_ONSTACK(done);
++	u8 ret = 0;
++
++	mutex_lock(&w1->mutex);
++	if (clk_enable(w1->clk))
++		goto out;
++
++	owr_begin(w1, &done, OI_BIT_XFER_DONE);
++	if (bit) {
++		owr_writel(w1, owr_control(w1) | OC_RD_BIT, OWR_CONTROL);
++		if (!owr_wait(w1, &done, OI_BIT_XFER_DONE))
++			ret = (owr_readl(w1, OWR_STATUS) >> OS_READ_BIT_SHIFT) & 1;
++		else
++			dev_err(w1->dev, "write-1/read failed\n");
++	} else {
++		owr_writel(w1, owr_control(w1) | OC_WR0_BIT, OWR_CONTROL);
++		if (owr_wait(w1, &done, OI_BIT_XFER_DONE))
++			dev_err(w1->dev, "write-0 failed\n");
++	}
++	owr_end(w1);
++	clk_disable(w1->clk);
++out:
++	mutex_unlock(&w1->mutex);
++	return ret;
++}
++
++/* Bus reset cycle: 0 if a slave answered with a presence pulse. */
++static u8 tegra_w1_reset_bus(void *data)
++{
++	struct tegra_w1 *w1 = data;
++	DECLARE_COMPLETION_ONSTACK(done);
++	u8 presence = 1;
++
++	mutex_lock(&w1->mutex);
++	if (clk_enable(w1->clk))
++		goto out;
++
++	owr_begin(w1, &done, OI_PRESENCE_DONE);
++	owr_writel(w1, owr_control(w1) | OC_GO, OWR_CONTROL);
++	if (!owr_wait(w1, &done, OI_PRESENCE_DONE))
++		presence = 0;
++	owr_end(w1);
++	clk_disable(w1->clk);
++out:
++	mutex_unlock(&w1->mutex);
++	return presence;
++}
++
++static int tegra_w1_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct reset_control *rst;
++	struct tegra_w1 *w1;
++	int irq, err;
++
++	w1 = devm_kzalloc(dev, sizeof(*w1), GFP_KERNEL);
++	if (!w1)
++		return -ENOMEM;
++
++	w1->dev = dev;
++	w1->timings = of_device_get_match_data(dev);
++	spin_lock_init(&w1->lock);
++	mutex_init(&w1->mutex);
++
++	w1->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(w1->base))
++		return PTR_ERR(w1->base);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	w1->clk = devm_clk_get_prepared(dev, NULL);
++	if (IS_ERR(w1->clk))
++		return dev_err_probe(dev, PTR_ERR(w1->clk), "no clock\n");
++
++	err = clk_set_rate(w1->clk, OWR_CLOCK);
++	if (err)
++		return dev_err_probe(dev, err, "cannot set clock to 1 MHz\n");
++
++	rst = devm_reset_control_get_optional_exclusive(dev, NULL);
++	if (IS_ERR(rst))
++		return dev_err_probe(dev, PTR_ERR(rst), "no reset\n");
++
++	err = clk_enable(w1->clk);
++	if (err)
++		return err;
++	reset_control_assert(rst);
++	udelay(2);
++	reset_control_deassert(rst);
++	owr_setup(w1);
++	clk_disable(w1->clk);
++
++	err = devm_request_irq(dev, irq, tegra_w1_irq, 0, dev_name(dev), w1);
++	if (err)
++		return err;
++
++	w1->bus_master.data = w1;
++	w1->bus_master.touch_bit = tegra_w1_touch_bit;
++	w1->bus_master.reset_bus = tegra_w1_reset_bus;
++
++	err = w1_add_master_device(&w1->bus_master);
++	if (err)
++		return err;
++
++	platform_set_drvdata(pdev, w1);
++	dev_info(dev, "one-wire bus master at %lu Hz\n", clk_get_rate(w1->clk));
++	return 0;
++}
++
++static void tegra_w1_remove(struct platform_device *pdev)
++{
++	struct tegra_w1 *w1 = platform_get_drvdata(pdev);
++
++	w1_remove_master_device(&w1->bus_master);
++}
++
++static const struct of_device_id tegra_w1_of_match[] = {
++	{ .compatible = "nvidia,tegra20-owr", .data = &tegra20_w1_timings },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, tegra_w1_of_match);
++
++static struct platform_driver tegra_w1_driver = {
++	.probe = tegra_w1_probe,
++	.remove = tegra_w1_remove,
++	.driver = {
++		.name = "tegra_w1",
++		.of_match_table = tegra_w1_of_match,
++	},
++};
++module_platform_driver(tegra_w1_driver);
++
++MODULE_DESCRIPTION("NVIDIA Tegra20 one-wire bus master");
++MODULE_AUTHOR("Andrei Warkentin <andreiw@motorola.com>");
++MODULE_LICENSE("GPL");

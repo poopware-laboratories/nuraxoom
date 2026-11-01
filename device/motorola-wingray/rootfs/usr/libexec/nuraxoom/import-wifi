@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Turn /sdcard/NuraXoom/wifi.txt into NetworkManager connections.
+# wifi.txt format, one network per line:   SSID<TAB>password
+# (or "SSID|password"; an empty password means an open network)
+dir=/etc/NetworkManager/system-connections
+mkdir -p $dir
+n=0
+tr -d '\r' < "$1" | while IFS= read -r line; do
+	case "$line" in ''|'#'*) continue ;; esac
+	case "$line" in
+		*"	"*) ssid=${line%%	*}; psk=${line#*	} ;;
+		*"|"*)  ssid=${line%%|*}; psk=${line#*|} ;;
+		*)      ssid=$line; psk= ;;
+	esac
+	n=$((n + 1))
+	f=$dir/wifi-txt-$n.nmconnection
+	{
+		printf '[connection]\nid=%s\ntype=wifi\nautoconnect=true\n\n' "$ssid"
+		printf '[wifi]\nmode=infrastructure\nssid=%s\n\n' "$ssid"
+		[ -n "$psk" ] && printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$psk"
+		printf '[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n'
+	} > "$f"
+	chmod 600 "$f"
+done

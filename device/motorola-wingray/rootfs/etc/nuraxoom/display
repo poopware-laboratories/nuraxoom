@@ -1,0 +1,5 @@
+# Xorg driver for the Sxmo session: auto | opentegra | modesetting
+# modesetting is what has been verified on the tablet (0.2.x); opentegra untested.
+# auto = try Tegra 2D acceleration, fall back to modesetting if X fails twice.
+# Change with: nuraxoom-display <mode>
+modesetting

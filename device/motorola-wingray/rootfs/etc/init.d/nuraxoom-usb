@@ -1,0 +1,60 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# USB gadget on the Xoom's micro-USB port (as ChatGPT's rescue initramfs did):
+#   CDC-ECM network  tablet 192.168.42.2, the computer gets 192.168.42.1 by DHCP
+#                    (no router/DNS offered: the computer's internet is untouched)
+#   CDC-ACM serial   login prompt on /dev/ttyGS0 (macOS: /dev/cu.usbmodem*)
+# Both work without drivers on Linux and macOS.
+description="NuraXoom USB network + serial console"
+G=/sys/kernel/config/usb_gadget/nuraxoom
+depend() {
+	need localmount
+	after modules
+}
+start() {
+	ebegin "Starting USB gadget (ECM + ACM)"
+	mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
+	if [ ! -d $G ]; then
+		mkdir -p $G/strings/0x409 $G/configs/c.1/strings/0x409 \
+			$G/functions/ecm.usb0 $G/functions/acm.GS0 || { eend 1 "no USB gadget configfs"; return 1; }
+		echo 0x1d6b > $G/idVendor
+		echo 0x0104 > $G/idProduct
+		cid=$(cat /sys/block/mmcblk0/device/cid 2>/dev/null)
+		h=$(printf '%s' "$cid" | sha256sum | cut -c1-8)
+		echo "NuraXoom" > $G/strings/0x409/manufacturer
+		echo "Motorola Xoom (Nura)" > $G/strings/0x409/product
+		echo "$h" > $G/strings/0x409/serialnumber
+		# Locally administered, stable per tablet
+		echo "02:58:$(echo $h | sed 's/../&:/g; s/:$//')" > $G/functions/ecm.usb0/dev_addr
+		echo "06:58:$(echo $h | sed 's/../&:/g; s/:$//')" > $G/functions/ecm.usb0/host_addr
+		echo "ECM network + serial console" > $G/configs/c.1/strings/0x409/configuration
+		echo 250 > $G/configs/c.1/MaxPower
+		ln -s $G/functions/ecm.usb0 $G/configs/c.1/
+		ln -s $G/functions/acm.GS0 $G/configs/c.1/
+	fi
+	udc=
+	i=0
+	while [ -z "$udc" ] && [ $i -lt 10 ]; do udc=$(ls /sys/class/udc 2>/dev/null | head -n1); [ -n "$udc" ] || sleep 1; i=$((i+1)); done
+	[ -n "$udc" ] || { eend 1 "no USB device controller"; return 1; }
+	[ -n "$(cat $G/UDC 2>/dev/null)" ] || echo "$udc" > $G/UDC
+	ip addr add 192.168.42.2/24 dev usb0 2>/dev/null
+	ip link set usb0 up
+	cat > /run/nuraxoom-udhcpd.conf <<-EOF
+	start 192.168.42.1
+	end 192.168.42.1
+	interface usb0
+	max_leases 1
+	lease_file /run/nuraxoom-udhcpd.leases
+	option subnet 255.255.255.0
+	option lease 86400
+	EOF
+	touch /run/nuraxoom-udhcpd.leases
+	start-stop-daemon -S -b -m -p /run/nuraxoom-udhcpd.pid -x /usr/sbin/udhcpd -- -f /run/nuraxoom-udhcpd.conf \
+		|| start-stop-daemon -S -b -m -p /run/nuraxoom-udhcpd.pid -x /bin/busybox -- udhcpd -f /run/nuraxoom-udhcpd.conf
+	eend 0
+}
+stop() {
+	start-stop-daemon -K -p /run/nuraxoom-udhcpd.pid 2>/dev/null
+	echo "" > $G/UDC 2>/dev/null
+	return 0
+}

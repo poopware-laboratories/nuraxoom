@@ -1,0 +1,18 @@
+diff --git a/sound/soc/codecs/cpcap.c b/sound/soc/codecs/cpcap.c
+index ffe452309..112fbf4ba 100644
+--- a/sound/soc/codecs/cpcap.c
++++ b/sound/soc/codecs/cpcap.c
+@@ -239,7 +239,12 @@ struct cpcap_reg_info {
+ };
+ 
+ static const struct cpcap_reg_info cpcap_default_regs[] = {
+-	{ CPCAP_REG_VAUDIOC, 0x003F, 0x0000 },
++	/*
++	 * VAUDIOC bits 0 (voltage select = on/off on the Xoom table), 1, 2 and 4
++	 * (mode) belong to the vaudio regulator: clearing them here switched the
++	 * audio rail off behind the regulator core, so no codec clock and no sound.
++	 */
++	{ CPCAP_REG_VAUDIOC, 0x0028, 0x0000 },
+ 	{ CPCAP_REG_CC, 0xFFFF, 0x0000 },
+ 	{ CPCAP_REG_CC, 0xFFFF, 0x0000 },
+ 	{ CPCAP_REG_CDI, 0xBFFF, 0x0000 },

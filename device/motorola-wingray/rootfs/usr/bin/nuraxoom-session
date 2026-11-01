@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# nuraxoom-session console|sxmo - choose what starts on boot (as root).
+#   console  text console on tty1 with a touch keyboard
+#   sxmo     Sxmo (dwm, X11) through tinydm
+# Takes effect on the next boot.
+set -e
+case "$1" in
+console)
+	rc-update del tinydm default 2>/dev/null || true
+	echo console > /etc/nuraxoom/session ;;
+sxmo)
+	rc-update add tinydm default
+	echo sxmo > /etc/nuraxoom/session ;;
+*)
+	echo "usage: nuraxoom-session console|sxmo (now: $(cat /etc/nuraxoom/session 2>/dev/null || echo sxmo))" >&2
+	exit 1 ;;
+esac
+echo "session: $1 (reboot to apply)"

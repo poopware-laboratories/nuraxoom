@@ -1,0 +1,26 @@
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bcmsdh.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bcmsdh.c
+@@ -117,12 +117,18 @@
+ 		}
+ 		sdiodev->oob_irq_requested = true;
+ 
+-		ret = enable_irq_wake(pdata->oob_irq_nr);
+-		if (ret != 0) {
+-			brcmf_err("enable_irq_wake failed %d\n", ret);
+-			return ret;
++		/* Wake capability is only needed when system sleep is built in.
++		 * Tegra omits irq_set_wake without CONFIG_PM_SLEEP, while
++		 * normal out-of-band interrupts remain available.
++		 */
++		if (IS_ENABLED(CONFIG_PM_SLEEP)) {
++			ret = enable_irq_wake(pdata->oob_irq_nr);
++			if (ret != 0) {
++				brcmf_err("enable_irq_wake failed %d\n", ret);
++				return ret;
++			}
++			disable_irq_wake(pdata->oob_irq_nr);
+ 		}
+-		disable_irq_wake(pdata->oob_irq_nr);
+ 
+ 		sdio_claim_host(sdiodev->func1);
+ 

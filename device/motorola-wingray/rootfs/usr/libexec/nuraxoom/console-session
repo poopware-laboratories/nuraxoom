@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# NuraXoom text console on tty1 (session=console): logs "user" in with a
+# touch keyboard (fbkeyboard) on the framebuffer. Run by inittab as root.
+# Switch to the Sxmo desktop with: doas nuraxoom-session sxmo
+# With session=sxmo, tinydm owns the display: just hold tty1 quietly.
+[ "$(cat /etc/nuraxoom/session 2>/dev/null)" = console ] || exec sleep 2147483647
+killall fbkeyboard 2>/dev/null
+modprobe uinput 2>/dev/null
+rot=$(cat /etc/nuraxoom/console-rotation 2>/dev/null)
+case "$rot" in 0|1|2|3) ;; *) rot=0 ;; esac
+echo "$rot" > /sys/class/graphics/fbcon/rotate_all 2>/dev/null || rot=0
+# Own session, no tty: login's vhangup() would otherwise SIGHUP it right away.
+setsid fbkeyboard -r "$rot" -f /usr/share/fonts/dejavu/DejaVuSans.ttf </dev/null >/run/fbkeyboard.log 2>&1 &
+printf '\nNuraXoom console - %s\nLogs: ~/sdcard/NuraXoom/logs   Desktop: doas nuraxoom-session sxmo\n\n' "$(uname -r)"
+exec /usr/bin/login -f user

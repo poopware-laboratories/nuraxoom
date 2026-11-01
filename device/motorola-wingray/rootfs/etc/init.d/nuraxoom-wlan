@@ -1,0 +1,37 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Prepare the BCM4329 (brcmfmac) Wi-Fi: board NVRAM with a per-tablet MAC, then
+# load the driver. NetworkManager does the rest (Sxmo > Networks).
+description="NuraXoom Wi-Fi"
+depend() {
+	need localmount
+	after modules udev-settle nuraxoom-firstboot
+	before networkmanager tinydm
+}
+start() {
+	ebegin "Waiting for wlan0"
+	# The stock NVRAM has its MAC stripped, so give the board file a macaddr=
+	# line *before* brcmfmac reads it. Stable, locally administered MAC from the
+	# eMMC CID. The file name follows the first DT compatible (motorola,wingray
+	# or motorola,mz605): write both.
+	if [ ! -e /sys/class/net/wlan0 ]; then
+		cid=$(cat /sys/block/mmcblk0/device/cid 2>/dev/null)
+		[ -n "$cid" ] || cid=$(cat /etc/machine-id 2>/dev/null)
+		h=$(printf '%s' "$cid" | sha256sum | cut -c1-10)
+		mac="02:$(echo $h | sed 's/../&:/g; s/:$//')"
+		fw=/usr/lib/firmware/brcm
+		for b in wingray mz605; do
+			{ grep -v '^macaddr=' /usr/share/nuraxoom/stock-wifi-nvram.txt; echo "macaddr=$mac"; } \
+				> $fw/brcmfmac4329-sdio.motorola,$b.txt.new && mv -f $fw/brcmfmac4329-sdio.motorola,$b.txt.new $fw/brcmfmac4329-sdio.motorola,$b.txt
+		done
+		# udev may have loaded it already (and given up without a MAC).
+		# brcmfmac_wcc holds brcmfmac. Never do this once wlan0 is up: unloading
+		# a running brcmfmac can take the whole tablet down.
+		modprobe -r brcmfmac_wcc brcmfmac 2>/dev/null
+	fi
+	modprobe brcmfmac 2>/dev/null
+	i=0
+	while [ ! -e /sys/class/net/wlan0 ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+	[ -e /sys/class/net/wlan0 ] || { eend 1 "wlan0 did not appear (see dmesg | grep brcm)"; return 0; }
+	eend 0
+}

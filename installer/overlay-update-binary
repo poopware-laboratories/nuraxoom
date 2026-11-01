@@ -1,0 +1,72 @@
+#!/sbin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# NuraXoom: small fix-up for an existing install. Unpacks nuraxoom/overlay.tar
+# (root-owned files at their rootfs paths) over /data/linux/nura.
+# If the zip carries nuraxoom/boot.img, it is written to the boot partition too
+# (Jelly Bean's boot is saved first, so NuraXoom-restore-boot.zip still works):
+# copy the zip over in Android, flash it in TWRP, and Nura boots again.
+# Touches nothing else: no /home, no settings.
+OUTFD=$2
+ZIP=$3
+ui() { echo "ui_print $*" >&"$OUTFD"; echo "ui_print" >&"$OUTFD"; }
+abort() { ui "!! $*"; ui "!! Nothing was changed."; exit 1; }
+T=/tmp/nxo
+rm -rf $T; mkdir -p $T && unzip -o -q "$ZIP" 'nuraxoom/*' -d $T && chmod 755 $T/nuraxoom/busybox || abort "cannot unpack the zip"
+bb() { $T/nuraxoom/busybox "$@"; }
+ui "NuraXoom update: $(bb cat $T/nuraxoom/NAME)"
+(cd $T/nuraxoom && bb sha256sum -c SHA256SUMS >/dev/null 2>&1) || abort "checksum mismatch (re-copy the zip)"
+grep -q ' /data ' /proc/mounts || mount /data || abort "cannot mount /data"
+R=/data/linux/nura
+[ -e $R/sbin/init ] || [ -L $R/sbin/init ] || abort "$R is not a NuraXoom install - flash the full zip"
+bb tar -tf $T/nuraxoom/overlay.tar | while read -r f; do ui "  $f"; done
+bb tar -xpf $T/nuraxoom/overlay.tar -C $R || abort "unpack failed"
+bb sync
+
+[ -f $T/nuraxoom/boot.img ] || { ui "Done. Reboot > System."; rm -rf $T; exit 0; }
+find_part() {
+	p=/dev/block/platform/sdhci-tegra.3/by-name/$1
+	[ -b "$p" ] && { echo "$p"; return 0; }
+	for u in /sys/class/block/*/uevent; do
+		bb grep -q "^PARTNAME=$1\$" "$u" 2>/dev/null || continue
+		n=$(bb sed -n 's/^DEVNAME=//p' "$u")
+		[ -b "/dev/block/$n" ] && { echo "/dev/block/$n"; return 0; }
+	done
+	# Last resort: the recovery's own fstab (old "/boot emmc /dev/..." or
+	# new "/dev/... /boot emmc" layout).
+	case $1 in boot) mp=/boot ;; userdata) mp=/data ;; *) return 1 ;; esac
+	for f in /etc/recovery.fstab /etc/twrp.fstab /etc/fstab /fstab.*; do
+		[ -f "$f" ] || continue
+		p=$(bb awk -v mp="$mp" '$1 !~ /^#/ {
+			if ($1 == mp && $3 ~ /^\/dev\//) { print $3; exit }
+			if ($2 == mp && $1 ~ /^\/dev\//) { print $1; exit } }' "$f")
+		[ -b "$p" ] && { echo "$p"; return 0; }
+	done
+	return 1
+}
+BOOT=$(find_part boot) || abort "boot partition not found"
+[ -d /data/media/0 ] && SD=/data/media/0 || SD=/data/media
+B=$SD/NuraXoom/backup
+bb mkdir -p "$B" || abort "cannot create $B"
+img=$T/nuraxoom/boot.img
+if [ "$(bb head -c "$(bb wc -c < "$img")" "$BOOT" | bb sha256sum | bb cut -d' ' -f1)" = "$(bb sha256sum "$img" | bb cut -d' ' -f1)" ]; then
+	ui "Boot partition already has this NuraXoom boot image."
+else
+	if [ ! -f "$B/boot-original.img" ]; then
+		bb dd if="$BOOT" of="$B/boot-original.img" bs=1M 2>/dev/null || abort "boot backup failed"
+		(cd "$B" && bb sha256sum boot-original.img > boot-original.img.sha256)
+		ui "Saved current (Android) boot to backup/boot-original.img"
+	fi
+	stamp=$(bb date +%Y%m%d-%H%M%S)
+	bb dd if="$BOOT" of="$B/boot-before-$stamp.img" bs=1M 2>/dev/null || abort "boot backup failed"
+	size=$(bb wc -c < "$img")
+	psize=$(( $(bb cat /sys/class/block/$(bb basename $(bb readlink -f "$BOOT"))/size) * 512 ))
+	[ "$size" -lt "$psize" ] || abort "boot.img larger than the boot partition"
+	bb dd if="$img" of="$BOOT" bs=1M 2>/dev/null || abort "boot write failed - flash NuraXoom-restore-boot.zip"
+	bb sync
+	[ "$(bb head -c "$size" "$BOOT" | bb sha256sum | bb cut -d' ' -f1)" = "$(bb sha256sum "$img" | bb cut -d' ' -f1)" ] \
+		|| ui "!! boot readback mismatch - flash NuraXoom-restore-boot.zip before rebooting"
+	ui "Wrote the NuraXoom boot image (back to Android: NuraXoom-restore-boot.zip)"
+fi
+ui "Done. Reboot > System."
+rm -rf $T
+exit 0

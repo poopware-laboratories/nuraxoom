@@ -1,0 +1,2 @@
+#!/bin/sh
+doas rc-service nuraxoom-logs restart && sxmo_notify_user.sh "Logs saved to /sdcard/NuraXoom/logs"

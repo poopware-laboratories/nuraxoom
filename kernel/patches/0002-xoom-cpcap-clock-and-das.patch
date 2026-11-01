@@ -1,0 +1,41 @@
+--- a/sound/soc/tegra/tegra_asoc_machine.c
++++ b/sound/soc/tegra/tegra_asoc_machine.c
+@@ -318,6 +318,16 @@
+ 	unsigned int clk_id = machine->asoc->mclk_id;
+ 	unsigned int new_baseclock;
+ 	int err;
++
++	/* The Xoom's CPCAP is I2S clock provider, using its fixed 26 MHz
++	 * reference (Motorola board-stingray and cpcap-audio-core).
++	 * It must not be described by a sample-rate * 256 Tegra MCLK:
++	 * e.g. 12.288 MHz at 48 kHz is rejected by the CPCAP driver.
++	 */
++	if (of_device_is_compatible(card->dev->of_node,
++				   "motorola,tegra-audio-cpcap-mz605"))
++		return snd_soc_dai_set_sysclk(codec_dai, 0, 26000000,
++					 SND_SOC_CLOCK_IN);
+ 
+ 	switch (srate) {
+ 	case 11025:
+--- a/sound/soc/tegra/tegra20_das.c
++++ b/sound/soc/tegra/tegra20_das.c
+@@ -10,6 +10,7 @@
+ #include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/slab.h>
+ #include <sound/soc.h>
+@@ -176,6 +177,11 @@
+ 				       TEGRA20_DAS_DAP_SEL_DAC1);
+ 	tegra20_das_connect_dac_to_dap(das, TEGRA20_DAS_DAC_ID_1,
+ 				       TEGRA20_DAS_DAC_SEL_DAP1);
++	/* Match Motorola init_dac1(): the CPCAP supplies DAP1 clocks. */
++	if (device_property_read_bool(&pdev->dev, "nvidia,dap1-codec-master"))
++		regmap_update_bits(das->regmap, TEGRA20_DAS_DAP_CTRL_SEL,
++			BIT(TEGRA20_DAS_DAP_CTRL_SEL_DAP_MS_SEL_P),
++			BIT(TEGRA20_DAS_DAP_CTRL_SEL_DAP_MS_SEL_P));
+ 	tegra20_das_connect_dap_to_dac(das, TEGRA20_DAS_DAP_ID_3,
+ 				       TEGRA20_DAS_DAP_SEL_DAC3);
+ 	tegra20_das_connect_dac_to_dap(das, TEGRA20_DAS_DAC_ID_3,

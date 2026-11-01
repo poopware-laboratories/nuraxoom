@@ -1,0 +1,134 @@
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -19,6 +19,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/clk.h>
++#include <linux/ktime.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/gpio/machine.h>
+ #include <linux/tty.h>
+@@ -131,6 +132,10 @@
+ 	struct clk		*txco_clk;
+ 	struct clk		*lpo_clk;
+ 	struct regulator_bulk_data supplies[BCM_NUM_SUPPLIES];
++	/* Motorola Stingray: BT and WLAN vote on existing U4-backed regulator. */
++	struct regulator	*stingray_shared;
++	bool			stingray_vote;
++	bool			stingray_i7_passive;
+ 	bool			res_enabled;
+ 
+ 	u32			init_speed;
+@@ -251,6 +256,18 @@
+ 	int err;
+ 
+ 	if (powered && !dev->res_enabled) {
++		/* Vote shared U4 *before* clock, reset or firmware operations.
++		 * MMC's vmmc consumer already owns the same regulator, so
++		 * the regulator core handles reference counting.
++		 */
++		if (dev->stingray_shared && !dev->stingray_vote) {
++			err = regulator_enable(dev->stingray_shared);
++			if (err)
++				return err;
++			dev->stingray_vote = true;
++			dev_info(dev->dev, "XOOM_V030 t_ns=%llu event=BT_U4_VOTE_ON\n",
++			 (unsigned long long)ktime_get_ns());
++		}
+ 		/* Intel Macs use bcm_apple_get_resources() and don't
+ 		 * have regulator supplies configured.
+ 		 */
+@@ -258,7 +275,7 @@
+ 			err = regulator_bulk_enable(BCM_NUM_SUPPLIES,
+ 						    dev->supplies);
+ 			if (err)
+-				return err;
++				goto err_stingray_vote;
+ 		}
+ 
+ 		/* LPO clock needs to be 32.768 kHz */
+@@ -286,6 +303,18 @@
+ 		goto err_revert_shutdown;
+ 
+ 	if (!powered && dev->res_enabled) {
++		/* Reset and device-wake were deasserted above. If dropping
++		 * the vote fails, leave other resources enabled and report
++		 * failure instead of claiming a completed power transition.
++		 */
++		if (dev->stingray_vote) {
++			err = regulator_disable(dev->stingray_shared);
++			if (err)
++				return err;
++			dev->stingray_vote = false;
++			dev_info(dev->dev, "XOOM_V030 t_ns=%llu event=BT_U4_VOTE_OFF\n",
++			 (unsigned long long)ktime_get_ns());
++		}
+ 		clk_disable_unprepare(dev->txco_clk);
+ 		clk_disable_unprepare(dev->lpo_clk);
+ 
+@@ -315,6 +344,15 @@
+ err_regulator_disable:
+ 	if (powered && !dev->res_enabled)
+ 		regulator_bulk_disable(BCM_NUM_SUPPLIES, dev->supplies);
++err_stingray_vote:
++	if (dev->stingray_vote) {
++		int ret = regulator_disable(dev->stingray_shared);
++
++		if (ret)
++			dev_err(dev->dev, "XOOM_V030 failed to unwind U4 vote: %d\n", ret);
++		else
++			dev->stingray_vote = false;
++	}
+ 	return err;
+ }
+ 
+@@ -1045,7 +1083,11 @@
+ 
+ static int bcm_gpio_set_shutdown(struct bcm_device *dev, bool powered)
+ {
+-	gpiod_set_value_cansleep(dev->shutdown, powered);
++	/* Stingray OEM held BT_SHUTDOWN/I7 low on either rfkill edge.
++	 * U0 BT_RST_N, not I7, controls Bluetooth core reset here.
++	 */
++	gpiod_set_value_cansleep(dev->shutdown,
++				  dev->stingray_i7_passive ? false : powered);
+ 	if (dev->reset)
+ 		/*
+ 		 * The reset line is asserted on powerdown and deasserted
+@@ -1055,6 +1097,9 @@
+ 		 * description.
+ 		 */
+ 		gpiod_set_value_cansleep(dev->reset, !powered);
++	if (dev->stingray_i7_passive)
++		dev_info(dev->dev, "XOOM_V030 t_ns=%llu event=BT_RESET_REQUEST release=%d i7_passive=1\n",
++			 (unsigned long long)ktime_get_ns(), powered);
+ 	return 0;
+ }
+ 
+@@ -1084,7 +1129,16 @@
+ 	int err;
+ 
+ 	dev->name = dev_name(dev->dev);
+-
++	/* Board-specific opt-in only; generic Broadcom devices unchanged. */
++	if (dev->dev->of_node &&
++	    of_device_is_compatible(dev->dev->of_node,
++					"motorola,stingray-bcm4329-bt") &&
++	    device_property_read_bool(dev->dev, "motorola,shared-u4-power")) {
++		dev->stingray_shared = devm_regulator_get(dev->dev, "shared");
++		if (IS_ERR(dev->stingray_shared))
++			return PTR_ERR(dev->stingray_shared);
++		dev->stingray_i7_passive = true;
++	}
+ 	if (x86_apple_machine && !bcm_apple_get_resources(dev))
+ 		return 0;
+ 
+@@ -1113,7 +1167,7 @@
+ 		return PTR_ERR(dev->shutdown);
+ 
+ 	dev->reset = devm_gpiod_get_optional(dev->dev, "reset",
+-					     GPIOD_OUT_LOW);
++					     dev->stingray_i7_passive ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+ 	if (IS_ERR(dev->reset))
+ 		return PTR_ERR(dev->reset);
+ 

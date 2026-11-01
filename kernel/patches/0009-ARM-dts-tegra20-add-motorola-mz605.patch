@@ -1,0 +1,84 @@
+diff --git a/arch/arm/boot/dts/nvidia/tegra20-motorola-mz605.dts b/arch/arm/boot/dts/nvidia/tegra20-motorola-mz605.dts
+new file mode 100644
+index 000000000..921f0f42e
+--- /dev/null
++++ b/arch/arm/boot/dts/nvidia/tegra20-motorola-mz605.dts
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Experimental MZ605 / umts_hubble derivative of the pinned Wingray board.
++// MZ605 board equivalence is not yet established on physical hardware.
++#include "tegra20-motorola-wingray.dts"
++
++/ {
++	model = "Motorola Xoom MZ605 (experimental, modem unused)";
++	compatible = "motorola,mz605", "motorola,xoom", "nvidia,tegra20";
++
++	// Keep scanout at bootloader RAM clocks without an absent EMC bandwidth provider.
++	host1x@50000000 {
++		dc@54200000 {
++			/delete-property/ interconnects;
++			/delete-property/ interconnect-names;
++		};
++		dc@54240000 {
++			/delete-property/ interconnects;
++			/delete-property/ interconnect-names;
++		};
++	};
++
++	sound {
++		compatible = "motorola,tegra-audio-cpcap-mz605", "nvidia,tegra-audio-cpcap";
++		// Motorola routes the external speaker amplifier from CPCAP LINEOUT.
++		nvidia,audio-routing =
++			"Headphones", "HSR", "Headphones", "HSL",
++			"Int Spk", "LINER", "Int Spk", "LINEL",
++			"HSMIC", "Mic Jack", "MICR", "Internal Mic 1", "MICL", "Internal Mic 2";
++	};
++	/*
++	 * Tegra20 one-wire controller (Motorola: TEGRA_OWR_BASE, INT_OWR =
++	 * INT_PRI_BASE + 30); the battery pack has a DS2781 fuel gauge on it.
++	 */
++	owr@7000c600 {
++		compatible = "nvidia,tegra20-owr";
++		reg = <0x7000c600 0x50>;
++		interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&tegra_car TEGRA20_CLK_OWR>;
++		resets = <&tegra_car 71>;
++		status = "okay";
++	};
++
++	das@70000c00 {
++		nvidia,dap1-codec-master;
++	};
++
++	usb@c5000000 {
++		compatible = "nvidia,tegra20-udc";
++		dr_mode = "peripheral";
++	};
++	usb-phy@c5000000 {
++		dr_mode = "peripheral";
++	};
++	// Shared-supply sequencing follows the related MZ600-tested Motorola patch.
++	serial@70006200 {
++		bluetooth {
++			compatible = "motorola,stingray-bcm4329-bt", "brcm,bcm4329-bt";
++			/*
++			 * 3375000 (mot.dtsi) is > 3 Mbaud: hci_bcm first sends 0xfc45
++			 * (48 MHz UART clock), which the BCM4329B1 rejects. 3000000 is
++			 * accepted by the chip (0xfc18) but is not an exact divisor of
++			 * the Tegra UART clock: the next command (HCI Reset) times out.
++			 * 921600 is a standard BCM ROM rate and enough for A2DP.
++			 */
++			max-speed = <921600>;
++			motorola,shared-u4-power;
++			shared-supply = <&reg_wifi_vdd>;
++			clock-names = "lpo";
++			status = "okay";
++		};
++	};
++	// Conservative legacy SDIO rate; this does not claim to fix BCM4329 F2.
++	mmc@c8000200 {
++		max-frequency = <25000000>;
++		assigned-clock-rates = <25000000>;
++		post-power-on-delay-ms = <100>;
++	};
++};

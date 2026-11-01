@@ -1,0 +1,10 @@
+#!/bin/sh
+# opentegra only: keep the Tegra 2D engine and host1x powered. With runtime PM
+# every EXA job powered GR2D up and down again (80-95 % system CPU while idle,
+# measured 2026-11-01). Under modesetting the GPU is unused: leave PM alone.
+mode=$(grep -v '^#' /etc/nuraxoom/display 2>/dev/null | head -n1)
+[ "$mode" = modesetting ] && exit 0
+for d in /sys/bus/platform/devices/*.gr2d /sys/bus/platform/devices/*.host1x; do
+	[ -w "$d/power/control" ] && echo on > "$d/power/control"
+done
+exit 0

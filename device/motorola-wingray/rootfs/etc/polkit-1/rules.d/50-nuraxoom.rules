@@ -1,0 +1,7 @@
+// NuraXoom has no logind, so no session is ever "active" and polkit's
+// allow_active defaults never apply. Grant what the Sxmo session needs.
+polkit.addRule(function(action, subject) {
+	// auto-rotate: sxmo_autorotate.sh -> monitor-sensor -> iio-sensor-proxy
+	if (action.id == "net.hadess.SensorProxy.claim-sensor" && subject.isInGroup("input"))
+		return polkit.Result.YES;
+});

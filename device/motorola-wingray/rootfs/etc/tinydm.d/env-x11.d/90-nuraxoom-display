@@ -1,0 +1,21 @@
+# Sourced by tinydm-run-session (as the session user) before every startx.
+_nx_state=/var/lib/nuraxoom
+_nx_mode=$(grep -v '^#' /etc/nuraxoom/display 2>/dev/null | head -n1)
+case "$_nx_mode" in
+opentegra|modesetting) _nx_drv=$_nx_mode ;;
+*)
+	_nx_tries=$(cat $_nx_state/opentegra-tries 2>/dev/null || echo 0)
+	if [ -e $_nx_state/opentegra-ok ]; then
+		_nx_drv=opentegra
+	elif [ "$_nx_tries" -lt 2 ]; then
+		echo $((_nx_tries + 1)) > $_nx_state/opentegra-tries
+		_nx_drv=opentegra
+	else
+		_nx_drv=modesetting
+	fi
+	;;
+esac
+export XORGCONFIG=nuraxoom-$_nx_drv.conf
+export NURAXOOM_XDRIVER=$_nx_drv
+echo "nuraxoom: Xorg driver $_nx_drv"
+unset _nx_state _nx_mode _nx_tries _nx_drv

@@ -1,0 +1,4 @@
+#!/bin/sh
+cur=$(nuraxoom-display status | head -n1)
+pick=$(printf 'Close\nauto\nopentegra\nmodesetting\n' | sxmo_dmenu.sh -p "Xorg ($cur)")
+case "$pick" in auto|opentegra|modesetting) sxmo_terminal.sh doas nuraxoom-display "$pick" ;; esac

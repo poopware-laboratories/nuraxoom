@@ -1,0 +1,55 @@
+#!/sbin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# NuraXoom: write only the bundled boot.img (test kernels). Saves the current
+# boot partition first; /data/linux and everything else is left alone.
+# Undo: NuraXoom-restore-boot.zip.
+OUTFD=$2
+ui() { echo "ui_print $*" >&"$OUTFD"; echo "ui_print" >&"$OUTFD"; }
+abort() { ui "!! $*"; ui "!! Nothing was written to the boot partition."; exit 1; }
+ZIP=$3
+T=/tmp/nxb
+rm -rf $T; mkdir -p $T && unzip -o -q "$ZIP" nuraxoom/busybox nuraxoom/boot.img nuraxoom/boot.img.sha256 nuraxoom/NAME -d $T && chmod 755 $T/nuraxoom/busybox || abort "cannot unpack the zip"
+bb() { $T/nuraxoom/busybox "$@"; }
+ui "NuraXoom - boot image only: $(bb cat $T/nuraxoom/NAME)"
+(cd $T/nuraxoom && bb sha256sum -c boot.img.sha256 >/dev/null 2>&1) || abort "boot.img checksum mismatch"
+grep -q ' /data ' /proc/mounts || mount /data || abort "cannot mount /data"
+[ -d /data/media/0 ] && SD=/data/media/0 || SD=/data/media
+[ -d /data/linux ] || abort "/data/linux missing - flash the NuraXoom install zip first"
+find_part() {
+	p=/dev/block/platform/sdhci-tegra.3/by-name/$1
+	[ -b "$p" ] && { echo "$p"; return 0; }
+	for u in /sys/class/block/*/uevent; do
+		bb grep -q "^PARTNAME=$1\$" "$u" 2>/dev/null || continue
+		n=$(bb sed -n 's/^DEVNAME=//p' "$u")
+		[ -b "/dev/block/$n" ] && { echo "/dev/block/$n"; return 0; }
+	done
+	# Last resort: the recovery's own fstab (old "/boot emmc /dev/..." or
+	# new "/dev/... /boot emmc" layout).
+	case $1 in boot) mp=/boot ;; userdata) mp=/data ;; *) return 1 ;; esac
+	for f in /etc/recovery.fstab /etc/twrp.fstab /etc/fstab /fstab.*; do
+		[ -f "$f" ] || continue
+		p=$(bb awk -v mp="$mp" '$1 !~ /^#/ {
+			if ($1 == mp && $3 ~ /^\/dev\//) { print $3; exit }
+			if ($2 == mp && $1 ~ /^\/dev\//) { print $1; exit } }' "$f")
+		[ -b "$p" ] && { echo "$p"; return 0; }
+	done
+	return 1
+}
+BOOT=$(find_part boot) || abort "boot partition not found"
+ui "boot: $BOOT"
+B=$SD/NuraXoom/backup
+bb mkdir -p "$B" || abort "cannot create $B"
+stamp=$(bb date +%Y%m%d-%H%M%S)
+bb dd if="$BOOT" of="$B/boot-before-$stamp.img" bs=1M 2>/dev/null || abort "boot backup failed"
+img=$T/nuraxoom/boot.img
+size=$(bb wc -c < "$img")
+psize=$(( $(bb cat /sys/class/block/$(bb basename $(bb readlink -f "$BOOT"))/size) * 512 ))
+[ "$size" -lt "$psize" ] || abort "boot.img larger than the boot partition"
+bb dd if="$img" of="$BOOT" bs=1M 2>/dev/null || abort "write failed - flash NuraXoom-restore-boot.zip"
+bb sync
+want=$(bb sha256sum "$img" | bb cut -d' ' -f1)
+got=$(bb head -c "$size" "$BOOT" | bb sha256sum | bb cut -d' ' -f1)
+[ "$want" = "$got" ] || ui "!! readback mismatch - flash NuraXoom-restore-boot.zip before rebooting"
+ui "Done. Reboot > System. Undo: NuraXoom-restore-boot.zip"
+rm -rf $T
+exit 0

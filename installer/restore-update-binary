@@ -1,0 +1,45 @@
+#!/sbin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# NuraXoom: put the boot partition back the way it was before NuraXoom.
+# Uses /sdcard/NuraXoom/backup/boot-original.img (made by the installer).
+# /data/linux is left alone; delete it yourself in TWRP if you want the space.
+OUTFD=$2
+ui() { echo "ui_print $*" >&"$OUTFD"; echo "ui_print" >&"$OUTFD"; }
+abort() { ui "!! $*"; exit 1; }
+ui "NuraXoom - restore original boot partition"
+ZIP=$3
+mkdir -p /tmp/nxr && unzip -o -q "$ZIP" nuraxoom/busybox -d /tmp/nxr && chmod 755 /tmp/nxr/nuraxoom/busybox || abort "cannot unpack busybox"
+bb() { /tmp/nxr/nuraxoom/busybox "$@"; }
+grep -q ' /data ' /proc/mounts || mount /data || abort "cannot mount /data"
+[ -d /data/media/0 ] && SD=/data/media/0 || SD=/data/media
+B=$SD/NuraXoom/backup
+IMG=$B/boot-original.img
+[ -f "$IMG" ] || abort "no $IMG (was NuraXoom ever installed from this sdcard?)"
+cd "$B" && bb sha256sum -c boot-original.img.sha256 >/dev/null 2>&1 || abort "backup checksum mismatch"
+find_part() {
+	p=/dev/block/platform/sdhci-tegra.3/by-name/$1
+	[ -b "$p" ] && { echo "$p"; return 0; }
+	for u in /sys/class/block/*/uevent; do
+		bb grep -q "^PARTNAME=$1\$" "$u" 2>/dev/null || continue
+		n=$(bb sed -n 's/^DEVNAME=//p' "$u")
+		[ -b "/dev/block/$n" ] && { echo "/dev/block/$n"; return 0; }
+	done
+	# Last resort: the recovery's own fstab (old "/boot emmc /dev/..." or
+	# new "/dev/... /boot emmc" layout).
+	case $1 in boot) mp=/boot ;; userdata) mp=/data ;; *) return 1 ;; esac
+	for f in /etc/recovery.fstab /etc/twrp.fstab /etc/fstab /fstab.*; do
+		[ -f "$f" ] || continue
+		p=$(bb awk -v mp="$mp" '$1 !~ /^#/ {
+			if ($1 == mp && $3 ~ /^\/dev\//) { print $3; exit }
+			if ($2 == mp && $1 ~ /^\/dev\//) { print $1; exit } }' "$f")
+		[ -b "$p" ] && { echo "$p"; return 0; }
+	done
+	return 1
+}
+BOOT=$(find_part boot) || abort "boot partition not found"
+ui "boot: $BOOT"
+bb dd if="$IMG" of="$BOOT" bs=1M 2>/dev/null || abort "write failed"
+bb sync
+ui "Original boot restored. /data/linux was not touched."
+ui "If Android still does not start, flash your CM zip again."
+exit 0

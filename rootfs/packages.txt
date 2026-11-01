@@ -1,0 +1,32 @@
+# Package set of the NuraXoom image (installed with apk.static, see
+# rootfs/build-nura-rootfs.sh). One package per line, # comments allowed.
+
+# Nura / postmarketOS base and the stock pmOS Sxmo (dwm, X11) user interface
+alpine-base
+postmarketos-base
+postmarketos-base-openrc
+postmarketos-ui-sxmo-de-dwm
+postmarketos-ui-sxmo-de-dwm-openrc
+postmarketos-zram-openrc
+
+# Hardware support
+linux-firmware-brcm
+wireless-regdb
+alsa-ucm-conf
+alsa-utils
+bluez
+iio-sensor-proxy
+xf86-input-libinput
+iw
+
+# Text console fallback (on-screen keyboard on tty1)
+fbkeyboard
+
+# Apps: a browser that runs without NEON (Firefox does not), basic tools
+netsurf
+htop
+fastfetch
+font-dejavu
+
+# Used by the TWRP zips (static busybox for recovery)
+busybox-static
