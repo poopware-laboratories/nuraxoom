@@ -1,0 +1,1093 @@
+From da47d149009029e0ac6387535b9aaf9302bbf154 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:00:00 -0300
+Subject: [PATCH 4/5] grate: textures, blending and wlroots' GLES2 shaders
+
+grate's TGSI fragment compiler only handles MOV, there were no sampler
+views and the blend state was ignored, so wlroots' GLES2 renderer
+crashed on its first textured draw.
+
+Tegra20 blends in the fragment program, so instead of a general
+compiler, recognise the fragment shaders wlroots uses (solid colour,
+texture * alpha, RGBX texture * alpha; Mesa's clear quad is the solid
+one) and run hand-written programs (fp/wlr/*.asm, assembled with
+xf86-video-opentegra's assembler into fp/wlr/wlr_programs.h). Each comes
+without blending and as premultiplied "over" (ONE, ONE_MINUS_SRC_ALPHA),
+chosen at draw time from the blend state.
+
+Also adds sampler views and sampler states for the fragment stage,
+texture descriptors (format, filters, wrap, NPOT sizes), fragment
+uniforms in fx10, and limits sampled formats to ones the 3D unit reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/fp/wlr/README       |  15 +
+ .../drivers/grate/fp/wlr/link_solid.asm       |   1 +
+ src/gallium/drivers/grate/fp/wlr/link_tex.asm |   1 +
+ src/gallium/drivers/grate/fp/wlr/solid.asm    |  20 ++
+ .../drivers/grate/fp/wlr/solid_over.asm       |  32 ++
+ src/gallium/drivers/grate/fp/wlr/tex.asm      |  30 ++
+ src/gallium/drivers/grate/fp/wlr/tex_over.asm |  49 +++
+ .../drivers/grate/fp/wlr/wlr_programs.h       | 302 ++++++++++++++++++
+ src/gallium/drivers/grate/grate_context.c     |   4 +
+ src/gallium/drivers/grate/grate_context.h     |   4 +
+ src/gallium/drivers/grate/grate_program.c     |   5 +
+ src/gallium/drivers/grate/grate_program.h     |   2 +
+ src/gallium/drivers/grate/grate_screen.c      |   9 +-
+ src/gallium/drivers/grate/grate_state.c       |  70 +++-
+ src/gallium/drivers/grate/grate_wlr.c         | 290 +++++++++++++++++
+ src/gallium/drivers/grate/grate_wlr.h         |  26 ++
+ src/gallium/drivers/grate/meson.build         |   2 +
+ 17 files changed, 857 insertions(+), 5 deletions(-)
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/README
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/link_solid.asm
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/link_tex.asm
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/solid.asm
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/solid_over.asm
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/tex.asm
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/tex_over.asm
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/wlr_programs.h
+ create mode 100644 src/gallium/drivers/grate/grate_wlr.c
+ create mode 100644 src/gallium/drivers/grate/grate_wlr.h
+
+diff --git a/src/gallium/drivers/grate/fp/wlr/README b/src/gallium/drivers/grate/fp/wlr/README
+new file mode 100644
+index 0000000..0b03553
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/README
+@@ -0,0 +1,15 @@
++Hand-written Tegra20 fragment programs for the fixed shaders of wlroots'
++GLES2 renderer (solid quad, textured quad), in grate/opentegra assembler
++syntax. grate's TGSI fragment compiler only handles MOV, so
++grate_create_fs_state() recognises these TGSI shapes and uses the programs
++below instead. Tegra20 blends in the fragment program, so each comes in a
++"blending off" and a premultiplied "over" (ONE, ONE_MINUS_SRC_ALPHA) form.
++
++Uniforms (fx10 halves, 1.0 = 256):
++  u0.l u0.h u1.l u1.h  solid: colour in render-target byte order
++                       tex:   alpha, alpha, alpha, alpha
++  u2.l                 tex: 1.0 = ignore texture alpha (RGBX)
++  u2.h                 tex: 1.0 = swap bytes 0 and 2 (RGBA texture,
++                       BGRA target or the other way round)
++
++Rebuild wlr_programs.h with NuraXoom's packages/mesa-grate/gen-wlr-fp.sh.
+diff --git a/src/gallium/drivers/grate/fp/wlr/link_solid.asm b/src/gallium/drivers/grate/fp/wlr/link_solid.asm
+new file mode 100644
+index 0000000..c6c6b07
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/link_solid.asm
+@@ -0,0 +1 @@
++LINK fp20, fp20, fp20, fp20, tram0.xyzw, export0
+diff --git a/src/gallium/drivers/grate/fp/wlr/link_tex.asm b/src/gallium/drivers/grate/fp/wlr/link_tex.asm
+new file mode 100644
+index 0000000..369ec76
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/link_tex.asm
+@@ -0,0 +1 @@
++LINK fp20, fp20, fp20, fp20, tram0.xyzw, export1
+diff --git a/src/gallium/drivers/grate/fp/wlr/solid.asm b/src/gallium/drivers/grate/fp/wlr/solid.asm
+new file mode 100644
+index 0000000..782b23c
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/solid.asm
+@@ -0,0 +1,20 @@
++// gl_FragColor = colour (blending off)
++pseq_to_dw_exec_nb = 1
++alu_buffer_size = 1
++
++.asm
++
++EXEC
++	MFU:	sfu:  rcp r4
++		mul0: bar, sfu, bar0
++		mul1: bar, sfu, bar1
++		ipl:  t0.fp20, t0.fp20, NOP, NOP
++
++	ALU:
++		ALU0:	MAD  r0.l, u0.l, #1, #0
++		ALU1:	MAD  r0.h, u0.h, #1, #0
++		ALU2:	MAD  r1.l, u1.l, #1, #0
++		ALU3:	MAD  r1.h, u1.h, #1, #0
++
++	DW:	store rt1, r0, r1
++;
+diff --git a/src/gallium/drivers/grate/fp/wlr/solid_over.asm b/src/gallium/drivers/grate/fp/wlr/solid_over.asm
+new file mode 100644
+index 0000000..dbd022a
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/solid_over.asm
+@@ -0,0 +1,32 @@
++// dst = colour + dst * (1 - colour.a)   (premultiplied over)
++pseq_to_dw_exec_nb = 2
++alu_buffer_size = 1
++
++.asm
++
++EXEC
++	MFU:	sfu:  rcp r4
++		mul0: bar, sfu, bar0
++		mul1: bar, sfu, bar1
++		ipl:  t0.fp20, t0.fp20, NOP, NOP
++;
++
++EXEC
++	// fetch dst pixel to r2,r3
++	PSEQ:	0x0081000A
++
++	// tmp = -colour.a * dst + dst
++	ALU:
++		ALU0:	MAD  lp.lh, -u1.h, r2.l, r2.l
++		ALU1:	MAD  lp.lh, -u1.h, r2.h, r2.h
++		ALU2:	MAD  lp.lh, -u1.h, r3.l, r3.l
++		ALU3:	MAD  lp.lh, -u1.h, r3.h, r3.h
++
++	ALU:
++		ALU0:	MAD  r0.l, u0.l, #1, alu0 (sat)
++		ALU1:	MAD  r0.h, u0.h, #1, alu1 (sat)
++		ALU2:	MAD  r1.l, u1.l, #1, alu2 (sat)
++		ALU3:	MAD  r1.h, u1.h, #1, alu3 (sat)
++
++	DW:	store rt1, r0, r1
++;
+diff --git a/src/gallium/drivers/grate/fp/wlr/tex.asm b/src/gallium/drivers/grate/fp/wlr/tex.asm
+new file mode 100644
+index 0000000..8dfdd02
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/tex.asm
+@@ -0,0 +1,30 @@
++// gl_FragColor = texture2D(tex0, v_texcoord) * alpha (blending off)
++pseq_to_dw_exec_nb = 1
++alu_buffer_size = 1
++
++.asm
++
++EXEC
++	MFU:	sfu:  rcp r4
++		mul0: bar, sfu, bar0
++		mul1: bar, sfu, bar1
++		ipl:  t0.fp20, t0.fp20, NOP, NOP
++
++	TEX:	tex r2, r3, tex0, r0, r1, r2
++
++	ALU:
++		// a = rgbx ? 1.0 : src.a
++		ALU0:	CSEL lp.lh, -u2.l, #1, r3.h
++
++		// swap bytes 0 and 2 if needed
++		ALU1:	CSEL lp.lh, -u2.h, r3.l, r2.l
++		ALU2:	CSEL lp.lh, -u2.h, r2.l, r3.l
++
++	ALU:
++		ALU0:	MAD  r0.l, alu1, u0.l, #0
++		ALU1:	MAD  r0.h, r2.h, u0.h, #0
++		ALU2:	MAD  r1.l, alu2, u1.l, #0
++		ALU3:	MAD  r1.h, alu0, u1.h, #0
++
++	DW:	store rt1, r0, r1
++;
+diff --git a/src/gallium/drivers/grate/fp/wlr/tex_over.asm b/src/gallium/drivers/grate/fp/wlr/tex_over.asm
+new file mode 100644
+index 0000000..15c7e2c
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/tex_over.asm
+@@ -0,0 +1,49 @@
++// src = texture2D(tex0, v_texcoord) * alpha
++// dst = src + dst * (1 - src.a)   (premultiplied over)
++pseq_to_dw_exec_nb = 2
++alu_buffer_size = 1
++
++.asm
++
++EXEC
++	MFU:	sfu:  rcp r4
++		mul0: bar, sfu, bar0
++		mul1: bar, sfu, bar1
++		ipl:  t0.fp20, t0.fp20, NOP, NOP
++
++	TEX:	tex r2, r3, tex0, r0, r1, r2
++
++	ALU:
++		// a = rgbx ? 1.0 : src.a
++		ALU0:	CSEL lp.lh, -u2.l, #1, r3.h
++
++		// swap bytes 0 and 2 if needed
++		ALU1:	CSEL lp.lh, -u2.h, r3.l, r2.l
++		ALU2:	CSEL lp.lh, -u2.h, r2.l, r3.l
++
++	ALU:
++		ALU0:	MAD  r0.l, alu1, u0.l, #0
++		ALU1:	MAD  r0.h, r2.h, u0.h, #0
++		ALU2:	MAD  r1.l, alu2, u1.l, #0
++		ALU3:	MAD  r1.h, alu0, u1.h, #0
++;
++
++EXEC
++	// fetch dst pixel to r2,r3
++	PSEQ:	0x0081000A
++
++	// tmp = -src.a * dst + dst
++	ALU:
++		ALU0:	MAD  lp.lh, -r1.h, r2.l, r2.l
++		ALU1:	MAD  lp.lh, -r1.h, r2.h, r2.h
++		ALU2:	MAD  lp.lh, -r1.h, r3.l, r3.l
++		ALU3:	MAD  lp.lh, -r1.h, r3.h, r3.h
++
++	ALU:
++		ALU0:	MAD  r0.l, r0.l, #1, alu0 (sat)
++		ALU1:	MAD  r0.h, r0.h, #1, alu1 (sat)
++		ALU2:	MAD  r1.l, r1.l, #1, alu2 (sat)
++		ALU3:	MAD  r1.h, r1.h, #1, alu3 (sat)
++
++	DW:	store rt1, r0, r1
++;
+diff --git a/src/gallium/drivers/grate/fp/wlr/wlr_programs.h b/src/gallium/drivers/grate/fp/wlr/wlr_programs.h
+new file mode 100644
+index 0000000..1f787b8
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/wlr_programs.h
+@@ -0,0 +1,302 @@
++/* Generated by NuraXoom's packages/mesa-grate/gen-wlr-fp.sh from fp/wlr */
++
++
++
++#ifndef fp_wlr_solid_def
++#define fp_wlr_solid_def
++static const uint32_t fs_wlr_solid_words[] = {
++    HOST1X_OPCODE_NONINCR(0x541, 1),
++    0x00000000,
++    HOST1X_OPCODE_IMM(0x500, 0x0),
++    HOST1X_OPCODE_NONINCR(0x601, 1),
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x604, 2),
++    0x104E51BA,
++    0x00000102,
++    HOST1X_OPCODE_NONINCR(0x701, 1),
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x801, 1),
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x804, 8),
++    0x00002808,
++    0x3F41F200,
++    0x00004828,
++    0x3F41F200,
++    0x0000A848,
++    0x3F41F200,
++    0x0000C868,
++    0x3F41F200,
++    HOST1X_OPCODE_NONINCR(0x806, 1),
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 1),
++    0x00020005,
++};
++#endif
++
++
++
++#ifndef lp_wlr_link_solid_def
++#define lp_wlr_link_solid_def
++static const uint32_t lnk_wlr_link_solid_words[] = {
++    HOST1X_OPCODE_INCR(0x300, 2),
++    0x00000000,
++    0x0000FEDC,
++};
++#endif
++
++#ifndef prog_wlr_solid_def
++#define prog_wlr_solid_def
++static const struct shader_program prog_wlr_solid = {
++
++    .fs_prog_words = fs_wlr_solid_words,
++    .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_solid_words),
++    .fs_alu_buf_size = 1,
++    .fs_pseq_to_dw = 1,
++    .fs_pseq_inst_nb = 1,
++
++    .linker_words = lnk_wlr_link_solid_words,
++    .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_solid_words),
++    .linker_inst_nb = 1,
++    .used_tram_rows_nb = 1,
++
++    .name = "wlr_solid",
++};
++#endif
++
++
++#ifndef fp_wlr_solid_over_def
++#define fp_wlr_solid_over_def
++static const uint32_t fs_wlr_solid_over_words[] = {
++    HOST1X_OPCODE_NONINCR(0x541, 2),
++    0x00000000,
++    0x0081000A,
++    HOST1X_OPCODE_IMM(0x500, 0x0),
++    HOST1X_OPCODE_NONINCR(0x601, 2),
++    0x00000001,
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x604, 2),
++    0x104E51BA,
++    0x00000102,
++    HOST1X_OPCODE_NONINCR(0x701, 2),
++    0x00000000,
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x801, 2),
++    0x00000000,
++    0x00000002,
++    HOST1X_OPCODE_NONINCR(0x804, 16),
++    0x000FE86A,
++    0x04402200,
++    0x000FE86A,
++    0x05402A00,
++    0x000FE86A,
++    0x06403200,
++    0x000FE86A,
++    0x07403A00,
++    0x01002808,
++    0x3F418000,
++    0x01004828,
++    0x3F419000,
++    0x0100A848,
++    0x3F41A000,
++    0x0100C868,
++    0x3F41B000,
++    HOST1X_OPCODE_NONINCR(0x806, 2),
++    0x00000000,
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 2),
++    0x00000000,
++    0x00020005,
++};
++#endif
++
++
++
++#ifndef lp_wlr_link_solid_def
++#define lp_wlr_link_solid_def
++static const uint32_t lnk_wlr_link_solid_words[] = {
++    HOST1X_OPCODE_INCR(0x300, 2),
++    0x00000000,
++    0x0000FEDC,
++};
++#endif
++
++#ifndef prog_wlr_solid_over_def
++#define prog_wlr_solid_over_def
++static const struct shader_program prog_wlr_solid_over = {
++
++    .fs_prog_words = fs_wlr_solid_over_words,
++    .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_solid_over_words),
++    .fs_alu_buf_size = 1,
++    .fs_pseq_to_dw = 2,
++    .fs_pseq_inst_nb = 2,
++
++    .linker_words = lnk_wlr_link_solid_words,
++    .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_solid_words),
++    .linker_inst_nb = 1,
++    .used_tram_rows_nb = 1,
++
++    .name = "wlr_solid_over",
++};
++#endif
++
++
++#ifndef fp_wlr_tex_def
++#define fp_wlr_tex_def
++static const uint32_t fs_wlr_tex_words[] = {
++    HOST1X_OPCODE_NONINCR(0x541, 1),
++    0x00000000,
++    HOST1X_OPCODE_IMM(0x500, 0x0),
++    HOST1X_OPCODE_NONINCR(0x601, 1),
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x604, 2),
++    0x104E51BA,
++    0x00000102,
++    HOST1X_OPCODE_NONINCR(0x701, 1),
++    0x00000420,
++    HOST1X_OPCODE_NONINCR(0x801, 1),
++    0x00000002,
++    HOST1X_OPCODE_NONINCR(0x804, 16),
++    0xC00FE88A,
++    0x3F403A00,
++    0xC00FE8AA,
++    0x06402200,
++    0xC00FE8AA,
++    0x04403200,
++    0x000FE7E8,
++    0x3E41F200,
++    0x00002640,
++    0x4041F200,
++    0x000040A8,
++    0x4141F200,
++    0x0000A680,
++    0x4241F200,
++    0x0000C600,
++    0x4341F200,
++    HOST1X_OPCODE_NONINCR(0x806, 1),
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 1),
++    0x00020005,
++};
++#endif
++
++
++
++#ifndef lp_wlr_link_tex_def
++#define lp_wlr_link_tex_def
++static const uint32_t lnk_wlr_link_tex_words[] = {
++    HOST1X_OPCODE_INCR(0x300, 2),
++    0x00000008,
++    0x0000FEDC,
++};
++#endif
++
++#ifndef prog_wlr_tex_def
++#define prog_wlr_tex_def
++static const struct shader_program prog_wlr_tex = {
++
++    .fs_prog_words = fs_wlr_tex_words,
++    .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_tex_words),
++    .fs_alu_buf_size = 1,
++    .fs_pseq_to_dw = 1,
++    .fs_pseq_inst_nb = 1,
++
++    .linker_words = lnk_wlr_link_tex_words,
++    .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_tex_words),
++    .linker_inst_nb = 1,
++    .used_tram_rows_nb = 1,
++
++    .name = "wlr_tex",
++};
++#endif
++
++
++#ifndef fp_wlr_tex_over_def
++#define fp_wlr_tex_over_def
++static const uint32_t fs_wlr_tex_over_words[] = {
++    HOST1X_OPCODE_NONINCR(0x541, 2),
++    0x00000000,
++    0x0081000A,
++    HOST1X_OPCODE_IMM(0x500, 0x0),
++    HOST1X_OPCODE_NONINCR(0x601, 2),
++    0x00000001,
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x604, 2),
++    0x104E51BA,
++    0x00000102,
++    HOST1X_OPCODE_NONINCR(0x701, 2),
++    0x00000420,
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x801, 2),
++    0x00000002,
++    0x0000000A,
++    HOST1X_OPCODE_NONINCR(0x804, 32),
++    0xC00FE88A,
++    0x3F403A00,
++    0xC00FE8AA,
++    0x06402200,
++    0xC00FE8AA,
++    0x04403200,
++    0x000FE7E8,
++    0x3E41F200,
++    0x00002640,
++    0x4041F200,
++    0x000040A8,
++    0x4141F200,
++    0x0000A680,
++    0x4241F200,
++    0x0000C600,
++    0x4341F200,
++    0x000FE06A,
++    0x04402200,
++    0x000FE06A,
++    0x05402A00,
++    0x000FE06A,
++    0x06403200,
++    0x000FE06A,
++    0x07403A00,
++    0x01002008,
++    0x3F418000,
++    0x01004028,
++    0x3F419000,
++    0x0100A048,
++    0x3F41A000,
++    0x0100C068,
++    0x3F41B000,
++    HOST1X_OPCODE_NONINCR(0x806, 2),
++    0x00000000,
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 2),
++    0x00000000,
++    0x00020005,
++};
++#endif
++
++
++
++#ifndef lp_wlr_link_tex_def
++#define lp_wlr_link_tex_def
++static const uint32_t lnk_wlr_link_tex_words[] = {
++    HOST1X_OPCODE_INCR(0x300, 2),
++    0x00000008,
++    0x0000FEDC,
++};
++#endif
++
++#ifndef prog_wlr_tex_over_def
++#define prog_wlr_tex_over_def
++static const struct shader_program prog_wlr_tex_over = {
++
++    .fs_prog_words = fs_wlr_tex_over_words,
++    .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_tex_over_words),
++    .fs_alu_buf_size = 1,
++    .fs_pseq_to_dw = 2,
++    .fs_pseq_inst_nb = 2,
++
++    .linker_words = lnk_wlr_link_tex_words,
++    .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_tex_words),
++    .linker_inst_nb = 1,
++    .used_tram_rows_nb = 1,
++
++    .name = "wlr_tex_over",
++};
++#endif
+diff --git a/src/gallium/drivers/grate/grate_context.c b/src/gallium/drivers/grate/grate_context.c
+index 0dd1779..145161c 100644
+--- a/src/gallium/drivers/grate/grate_context.c
++++ b/src/gallium/drivers/grate/grate_context.c
+@@ -1,6 +1,7 @@
+ #include <errno.h>
+ #include <stdio.h>
+ 
++#include "util/u_inlines.h"
+ #include "util/u_memory.h"
+ #include "util/u_upload_mgr.h"
+ 
+@@ -66,6 +67,9 @@ grate_context_destroy(struct pipe_context *pcontext)
+    if (context->primconvert)
+       util_primconvert_destroy(context->primconvert);
+ 
++   for (unsigned i = 0; i < ARRAY_SIZE(context->fragment_views); i++)
++      pipe_sampler_view_reference(&context->fragment_views[i], NULL);
++
+    slab_destroy_child(&context->transfer_pool);
+ 
+    grate_channel_delete(context->gr3d);
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index 355fc52..b7c2900 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -44,6 +44,10 @@ struct grate_context {
+ 
+    struct grate_vertex_shader_state *vshader;
+    struct grate_fragment_shader_state *fshader;
++   struct pipe_blend_state *blend;
++
++   struct pipe_sampler_view *fragment_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
++   struct pipe_sampler_state *fragment_samplers[PIPE_MAX_SAMPLERS];
+ 
+    uint32_t no_scissor[3];
+    uint32_t viewport[10];
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index f5911d0..c7bb271 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -170,6 +170,11 @@ grate_create_fs_state(struct pipe_context *pcontext,
+       fprintf(stderr, "\n");
+    }
+ 
++   /* the program is chosen at draw time with the blend state */
++   so->wlr = grate_wlr_classify_fs(template->tokens);
++   if (so->wlr != GRATE_WLR_FP_NONE)
++      return so;
++
+    struct tgsi_parse_context parser;
+    unsigned ok = tgsi_parse_init(&parser, template->tokens);
+    assert(ok == TGSI_PARSE_OK);
+diff --git a/src/gallium/drivers/grate/grate_program.h b/src/gallium/drivers/grate/grate_program.h
+index 47445a4..3ab289d 100644
+--- a/src/gallium/drivers/grate/grate_program.h
++++ b/src/gallium/drivers/grate/grate_program.h
+@@ -5,6 +5,7 @@
+ #include "pipe/p_state.h"
+ 
+ #include "grate_compiler.h"
++#include "grate_wlr.h"
+ 
+ struct grate_shader_blob {
+    uint32_t *commands;
+@@ -26,6 +27,7 @@ struct grate_fragment_shader_state {
+    struct pipe_shader_state base;
+    struct grate_shader_blob blob;
+    struct grate_fp_info info;
++   enum grate_wlr_fp wlr;
+ };
+ 
+ void
+diff --git a/src/gallium/drivers/grate/grate_screen.c b/src/gallium/drivers/grate/grate_screen.c
+index 1c1bc65..8078e7f 100755
+--- a/src/gallium/drivers/grate/grate_screen.c
++++ b/src/gallium/drivers/grate/grate_screen.c
+@@ -575,8 +575,13 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
+                                  unsigned storage_sample_count,
+                                  unsigned usage)
+ {
+-   if (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL)) {
+-      if (grate_pixel_format(format) < 0)
++   if (sample_count > 1)
++      return false;
++
++   /* the texture units take the same formats as the render targets */
++   if (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL |
++                PIPE_BIND_SAMPLER_VIEW)) {
++      if (target != PIPE_BUFFER && grate_pixel_format(format) < 0)
+          return false;
+    }
+ 
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index c973d6a..b048e6c 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -184,7 +184,55 @@ grate_set_sampler_views(struct pipe_context *pctx, enum pipe_shader_type shader,
+                         bool take_ownership,
+                         struct pipe_sampler_view **views)
+ {
+-   unimplemented();
++   struct grate_context *context = grate_context(pctx);
++   struct pipe_sampler_view **slots = context->fragment_views;
++   unsigned i;
++
++   if (shader != PIPE_SHADER_FRAGMENT) {
++      unimplemented();
++      return;
++   }
++
++   for (i = 0; i < num_views; i++) {
++      struct pipe_sampler_view *view = views ? views[i] : NULL;
++
++      if (take_ownership) {
++         pipe_sampler_view_reference(&slots[start_slot + i], NULL);
++         slots[start_slot + i] = view;
++      } else {
++         pipe_sampler_view_reference(&slots[start_slot + i], view);
++      }
++   }
++
++   for (; i < num_views + unbind_num_trailing_slots; i++)
++      pipe_sampler_view_reference(&slots[start_slot + i], NULL);
++}
++
++static struct pipe_sampler_view *
++grate_create_sampler_view(struct pipe_context *pctx,
++                          struct pipe_resource *texture,
++                          const struct pipe_sampler_view *template)
++{
++   struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
++
++   if (!view)
++      return NULL;
++
++   *view = *template;
++   pipe_reference_init(&view->reference, 1);
++   view->texture = NULL;
++   pipe_resource_reference(&view->texture, texture);
++   view->context = pctx;
++
++   return view;
++}
++
++static void
++grate_sampler_view_destroy(struct pipe_context *pctx,
++                           struct pipe_sampler_view *view)
++{
++   pipe_resource_reference(&view->texture, NULL);
++   FREE(view);
+ }
+ 
+ static void
+@@ -223,6 +271,8 @@ grate_context_state_init(struct pipe_context *pcontext)
+    pcontext->set_scissor_states = grate_set_scissor_states;
+    pcontext->set_viewport_states = grate_set_viewport_states;
+    pcontext->set_sampler_views = grate_set_sampler_views;
++   pcontext->create_sampler_view = grate_create_sampler_view;
++   pcontext->sampler_view_destroy = grate_sampler_view_destroy;
+    pcontext->set_vertex_buffers = grate_set_vertex_buffers;
+ }
+ 
+@@ -242,7 +292,7 @@ grate_create_blend_state(struct pipe_context *pcontext,
+ static void
+ grate_bind_blend_state(struct pipe_context *pcontext, void *so)
+ {
+-   unimplemented();
++   grate_context(pcontext)->blend = so;
+ }
+ 
+ static void
+@@ -277,7 +327,15 @@ grate_bind_sampler_states(struct pipe_context *pcontext,
+                           unsigned shader, unsigned start_slot,
+                           unsigned num_samplers, void **samplers)
+ {
+-   unimplemented();
++   struct grate_context *context = grate_context(pcontext);
++
++   if (shader != PIPE_SHADER_FRAGMENT) {
++      unimplemented();
++      return;
++   }
++
++   for (unsigned i = 0; i < num_samplers; i++)
++      context->fragment_samplers[start_slot + i] = samplers ? samplers[i] : NULL;
+ }
+ 
+ static void
+@@ -663,6 +721,12 @@ emit_program(struct grate_context *context)
+    struct grate_stream *stream = &context->gr3d->stream;
+ 
+    emit_shader(stream, &context->vshader->blob);
++
++   if (context->fshader->wlr != GRATE_WLR_FP_NONE) {
++      grate_wlr_emit_program(context);
++      return;
++   }
++
+    emit_shader(stream, &context->fshader->blob);
+ 
+    uint32_t cull_face_linker_setup = TGR3D_VAL(CULL_FACE_LINKER_SETUP,
+diff --git a/src/gallium/drivers/grate/grate_wlr.c b/src/gallium/drivers/grate/grate_wlr.c
+new file mode 100644
+index 0000000..8ccc478
+--- /dev/null
++++ b/src/gallium/drivers/grate/grate_wlr.c
+@@ -0,0 +1,290 @@
++#include <stdio.h>
++#include <math.h>
++
++#include "tgsi/tgsi_parse.h"
++#include "util/u_math.h"
++
++#include "grate_common.h"
++#include "grate_context.h"
++#include "grate_program.h"
++#include "grate_resource.h"
++#include "grate_wlr.h"
++
++#include "tgr_3d.xml.h"
++#include "host1x01_hardware.h"
++
++/*
++ * What the generated wlr_programs.h expects from opentegra's gr3d.h; as
++ * host1x_opcode_*(), but usable in static initializers.
++ */
++#define HOST1X_OPCODE_INCR(offset, count)    ((1u << 28) | ((offset) << 16) | (count))
++#define HOST1X_OPCODE_NONINCR(offset, count) ((2u << 28) | ((offset) << 16) | (count))
++#define HOST1X_OPCODE_IMM(offset, data)      ((4u << 28) | ((offset) << 16) | (data))
++#define TEGRA_ARRAY_SIZE(x) ARRAY_SIZE(x)
++
++struct shader_program {
++   const uint32_t *fs_prog_words;
++   const unsigned fs_prog_words_nb;
++   const unsigned fs_alu_buf_size;
++   const unsigned fs_pseq_to_dw;
++   const unsigned fs_pseq_inst_nb;
++
++   const uint32_t *linker_words;
++   const unsigned linker_words_nb;
++   const unsigned linker_inst_nb;
++   const unsigned used_tram_rows_nb;
++
++   const char *name;
++};
++
++#include "fp/wlr/wlr_programs.h"
++
++static bool
++is_const0(const struct tgsi_full_src_register *src)
++{
++   return src->Register.File == TGSI_FILE_CONSTANT &&
++          src->Register.Index == 0 && !src->Register.Indirect;
++}
++
++static bool
++is_tex_input0(const struct tgsi_full_instruction *inst)
++{
++   return inst->Instruction.Opcode == TGSI_OPCODE_TEX &&
++          inst->Texture.Texture == TGSI_TEXTURE_2D &&
++          inst->Src[0].Register.File == TGSI_FILE_INPUT &&
++          inst->Src[0].Register.Index == 0 &&
++          inst->Src[1].Register.File == TGSI_FILE_SAMPLER &&
++          inst->Src[1].Register.Index == 0;
++}
++
++static bool
++is_mul_alpha_out(const struct tgsi_full_instruction *inst)
++{
++   const struct tgsi_src_register *a = &inst->Src[1].Register;
++
++   return inst->Instruction.Opcode == TGSI_OPCODE_MUL &&
++          inst->Dst[0].Register.File == TGSI_FILE_OUTPUT &&
++          inst->Dst[0].Register.WriteMask == TGSI_WRITEMASK_XYZW &&
++          is_const0(&inst->Src[1]) &&
++          a->SwizzleX == TGSI_SWIZZLE_X && a->SwizzleY == TGSI_SWIZZLE_X &&
++          a->SwizzleZ == TGSI_SWIZZLE_X && a->SwizzleW == TGSI_SWIZZLE_X;
++}
++
++enum grate_wlr_fp
++grate_wlr_classify_fs(const struct tgsi_token *tokens)
++{
++   struct tgsi_full_instruction insts[4];
++   struct tgsi_parse_context parser;
++   unsigned n = 0;
++
++   if (tgsi_parse_init(&parser, tokens) != TGSI_PARSE_OK)
++      return GRATE_WLR_FP_NONE;
++
++   while (!tgsi_parse_end_of_tokens(&parser)) {
++      tgsi_parse_token(&parser);
++      if (parser.FullToken.Token.Type != TGSI_TOKEN_TYPE_INSTRUCTION ||
++          parser.FullToken.FullInstruction.Instruction.Opcode == TGSI_OPCODE_END)
++         continue;
++      if (n == ARRAY_SIZE(insts)) {
++         n++;
++         break;
++      }
++      insts[n++] = parser.FullToken.FullInstruction;
++   }
++   tgsi_parse_free(&parser);
++
++   if (n == 1 && insts[0].Instruction.Opcode == TGSI_OPCODE_MOV &&
++       insts[0].Dst[0].Register.File == TGSI_FILE_OUTPUT &&
++       insts[0].Dst[0].Register.WriteMask == TGSI_WRITEMASK_XYZW &&
++       is_const0(&insts[0].Src[0]) &&
++       insts[0].Src[0].Register.SwizzleX == TGSI_SWIZZLE_X &&
++       insts[0].Src[0].Register.SwizzleY == TGSI_SWIZZLE_Y &&
++       insts[0].Src[0].Register.SwizzleZ == TGSI_SWIZZLE_Z &&
++       insts[0].Src[0].Register.SwizzleW == TGSI_SWIZZLE_W)
++      return GRATE_WLR_FP_SOLID;
++
++   if (n == 2 && is_tex_input0(&insts[0]) && is_mul_alpha_out(&insts[1]))
++      return GRATE_WLR_FP_TEX;
++
++   /* TEX t; MOV t.xyz, t; MOV t.w, IMM(1.0); MUL OUT, t, CONST[0].xxxx */
++   if (n == 4 && is_tex_input0(&insts[0]) &&
++       insts[1].Instruction.Opcode == TGSI_OPCODE_MOV &&
++       insts[1].Dst[0].Register.WriteMask == TGSI_WRITEMASK_XYZ &&
++       insts[2].Instruction.Opcode == TGSI_OPCODE_MOV &&
++       insts[2].Dst[0].Register.WriteMask == TGSI_WRITEMASK_W &&
++       insts[2].Src[0].Register.File == TGSI_FILE_IMMEDIATE &&
++       is_mul_alpha_out(&insts[3]))
++      return GRATE_WLR_FP_TEX_RGBX;
++
++   return GRATE_WLR_FP_NONE;
++}
++
++/* fx10: 10-bit signed fixed point, 1.0 = 256 */
++static uint32_t
++fx10(float f)
++{
++   return (uint32_t)lrintf(CLAMP(f, -2.0f, 1.99609375f) * 256.0f) & 0x3ff;
++}
++
++static uint32_t
++fx10x2(float lo, float hi)
++{
++   return fx10(hi) << 10 | fx10(lo);
++}
++
++static bool
++blend_over(struct grate_context *context)
++{
++   static bool warned;
++   const struct pipe_rt_blend_state *rt;
++
++   if (!context->blend || !context->blend->rt[0].blend_enable)
++      return false;
++
++   rt = &context->blend->rt[0];
++   if (!warned &&
++       (rt->rgb_func != PIPE_BLEND_ADD ||
++        rt->rgb_src_factor != PIPE_BLENDFACTOR_ONE ||
++        rt->rgb_dst_factor != PIPE_BLENDFACTOR_INV_SRC_ALPHA)) {
++      fprintf(stderr, "grate: only premultiplied-over blending is "
++              "implemented, drawing other blend modes as it\n");
++      warned = true;
++   }
++
++   return true;
++}
++
++static void
++emit_texture(struct grate_context *context)
++{
++   struct grate_stream *stream = &context->gr3d->stream;
++   struct pipe_sampler_view *view = context->fragment_views[0];
++   const struct pipe_sampler_state *samp = context->fragment_samplers[0];
++   struct grate_resource *tex;
++   unsigned width, height;
++   uint32_t desc1, desc2;
++   bool min_linear = false, mag_linear = false, clamp = true, mirror = false;
++
++   if (!view || !view->texture)
++      return;
++
++   tex = grate_resource(view->texture);
++   width = view->texture->width0;
++   height = view->texture->height0;
++
++   if (samp) {
++      min_linear = samp->min_img_filter == PIPE_TEX_FILTER_LINEAR;
++      mag_linear = samp->mag_img_filter == PIPE_TEX_FILTER_LINEAR;
++      clamp = samp->wrap_s != PIPE_TEX_WRAP_REPEAT &&
++              samp->wrap_s != PIPE_TEX_WRAP_MIRROR_REPEAT;
++      mirror = samp->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT;
++   }
++
++   desc1  = TGR3D_VAL(TEXTURE_DESC1, FORMAT, tex->format);
++   desc1 |= TGR3D_BOOL(TEXTURE_DESC1, MINFILTER_LINEAR_WITHIN, min_linear);
++   desc1 |= TGR3D_BOOL(TEXTURE_DESC1, MAGFILTER_LINEAR, mag_linear);
++   desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_S_CLAMP_TO_EDGE, clamp);
++   desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_T_CLAMP_TO_EDGE, clamp);
++   desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_S_MIRRORED_REPEAT, mirror);
++   desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_T_MIRRORED_REPEAT, mirror);
++
++   desc2 = TGR3D_BOOL(TEXTURE_DESC2, MIPMAP_DISABLE, 1);
++   if (util_is_power_of_two_nonzero(width) &&
++       util_is_power_of_two_nonzero(height)) {
++      desc2 |= TGR3D_VAL(TEXTURE_DESC2, WIDTH_LOG2, util_logbase2(width));
++      desc2 |= TGR3D_VAL(TEXTURE_DESC2, HEIGHT_LOG2, util_logbase2(height));
++   } else {
++      desc2 |= TGR3D_BOOL(TEXTURE_DESC2, NOT_POW2_DIMENSIONS, 1);
++      desc2 |= TGR3D_VAL(TEXTURE_DESC2, WIDTH, width);
++      desc2 |= TGR3D_VAL(TEXTURE_DESC2, HEIGHT, height);
++   }
++
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_TEXTURE_DESC1(0), 2));
++   grate_stream_push(stream, desc1);
++   grate_stream_push(stream, desc2);
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_TEXTURE_POINTER(0), 1));
++   grate_stream_push_reloc(stream, tex->bo, 0);
++}
++
++static void
++emit_uniforms(struct grate_context *context, enum grate_wlr_fp kind)
++{
++   struct grate_stream *stream = &context->gr3d->stream;
++   const struct pipe_constant_buffer *cb =
++      &context->constant_buffer[PIPE_SHADER_FRAGMENT];
++   const float *c = cb->user_buffer;
++   float zero[4] = { 0 };
++
++   if (!c || cb->buffer_size < 4 * sizeof(float))
++      c = zero;
++
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_FP_CONST(0), 3));
++   if (kind == GRATE_WLR_FP_SOLID) {
++      /* render targets are B8G8R8A8/X8: bytes b, g, r, a */
++      grate_stream_push(stream, fx10x2(c[2], c[1]));
++      grate_stream_push(stream, fx10x2(c[0], c[3]));
++      grate_stream_push(stream, 0);
++   } else {
++      grate_stream_push(stream, fx10x2(c[0], c[0]));
++      grate_stream_push(stream, fx10x2(c[0], c[0]));
++      grate_stream_push(stream, fx10x2(kind == GRATE_WLR_FP_TEX_RGBX, 0));
++   }
++}
++
++void
++grate_wlr_emit_program(struct grate_context *context)
++{
++   struct grate_stream *stream = &context->gr3d->stream;
++   enum grate_wlr_fp kind = context->fshader->wlr;
++   bool over = blend_over(context);
++   const struct shader_program *prog;
++   unsigned pseq_cfg = 0x12c;
++   uint32_t value;
++
++   if (kind == GRATE_WLR_FP_SOLID)
++      prog = over ? &prog_wlr_solid_over : &prog_wlr_solid;
++   else
++      prog = over ? &prog_wlr_tex_over : &prog_wlr_tex;
++
++   /* as opentegra's tgr3d_upload_program(), without the vertex program */
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_FP_PSEQ_DW_CFG, 1));
++   grate_stream_push(stream, TGR3D_VAL(FP_PSEQ_DW_CFG, PSEQ_TO_DW_EXEC_NB,
++                                       prog->fs_pseq_to_dw));
++
++   value  = TGR3D_VAL(ALU_BUFFER_SIZE, SIZE, prog->fs_alu_buf_size - 1);
++   value |= TGR3D_VAL(ALU_BUFFER_SIZE, SIZEx4,
++                      (pseq_cfg - 1) / (prog->fs_alu_buf_size * 4));
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_ALU_BUFFER_SIZE, 1));
++   grate_stream_push(stream, value);
++   grate_stream_push(stream, host1x_opcode_incr(0x501, 1));
++   grate_stream_push(stream, (0x2200 << 16) | (0x0032 << 16) |
++                             (pseq_cfg << 4) | 0xf);
++
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_FP_PSEQ_ENGINE_INST, 1));
++   grate_stream_push(stream, 0x20006000 | prog->fs_pseq_inst_nb);
++
++   value  = TGR3D_VAL(TRAM_SETUP, USED_TRAM_ROWS_NB, prog->used_tram_rows_nb);
++   value |= TGR3D_VAL(TRAM_SETUP, DIV64, 64 / prog->used_tram_rows_nb);
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_TRAM_SETUP, 1));
++   grate_stream_push(stream, value);
++
++   value  = TGR3D_VAL(CULL_FACE_LINKER_SETUP, UNK_18_31, 0x2e38);
++   value |= context->rast->cull_face[context->y_invert];
++   value |= TGR3D_VAL(CULL_FACE_LINKER_SETUP, LINKER_INST_COUNT,
++                      prog->linker_inst_nb - 1);
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_CULL_FACE_LINKER_SETUP, 1));
++   grate_stream_push(stream, value);
++
++   grate_stream_push(stream, host1x_opcode_imm(TGR3D_FP_PSEQ_QUAD_ID, 0));
++   grate_stream_push(stream, host1x_opcode_imm(TGR3D_FP_UPLOAD_INST_ID_COMMON, 0));
++   grate_stream_push(stream, host1x_opcode_imm(TGR3D_FP_UPLOAD_MFU_INST_ID, 0));
++   grate_stream_push(stream, host1x_opcode_imm(TGR3D_FP_UPLOAD_ALU_INST_ID, 0));
++   grate_stream_push_words(stream, prog->fs_prog_words,
++                           prog->fs_prog_words_nb, 0);
++   grate_stream_push_words(stream, prog->linker_words,
++                           prog->linker_words_nb, 0);
++
++   emit_uniforms(context, kind);
++   if (kind != GRATE_WLR_FP_SOLID)
++      emit_texture(context);
++}
+diff --git a/src/gallium/drivers/grate/grate_wlr.h b/src/gallium/drivers/grate/grate_wlr.h
+new file mode 100644
+index 0000000..149d7ef
+--- /dev/null
++++ b/src/gallium/drivers/grate/grate_wlr.h
+@@ -0,0 +1,26 @@
++#ifndef GRATE_WLR_H
++#define GRATE_WLR_H
++
++#include "pipe/p_state.h"
++
++struct grate_context;
++
++/*
++ * Fragment shaders of wlroots' GLES2 renderer (and Mesa's own clear quad)
++ * that grate runs with hand-written programs from fp/wlr/, since its TGSI
++ * fragment compiler only handles MOV.
++ */
++enum grate_wlr_fp {
++   GRATE_WLR_FP_NONE = 0,
++   GRATE_WLR_FP_SOLID,     /* OUT = CONST[0] */
++   GRATE_WLR_FP_TEX,       /* OUT = TEX(IN[0]) * CONST[0].x */
++   GRATE_WLR_FP_TEX_RGBX,  /* OUT = vec4(TEX(IN[0]).rgb, 1) * CONST[0].x */
++};
++
++enum grate_wlr_fp
++grate_wlr_classify_fs(const struct tgsi_token *tokens);
++
++void
++grate_wlr_emit_program(struct grate_context *context);
++
++#endif
+diff --git a/src/gallium/drivers/grate/meson.build b/src/gallium/drivers/grate/meson.build
+index 2d044b6..ac27150 100644
+--- a/src/gallium/drivers/grate/meson.build
++++ b/src/gallium/drivers/grate/meson.build
+@@ -57,6 +57,8 @@ files_libgrate = files(
+   'grate_stream.h',
+   'grate_surface.c',
+   'grate_surface.h',
++  'grate_wlr.c',
++  'grate_wlr.h',
+ )
+ 
+ inc_libgrate = include_directories('drm')

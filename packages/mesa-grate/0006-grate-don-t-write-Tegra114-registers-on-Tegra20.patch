@@ -1,0 +1,113 @@
+From 10460880b23a95ccd92d8ad57b627502a3161777 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:30:00 -0300
+Subject: [PATCH 6/9] grate: don't write Tegra114 registers on Tegra20
+
+grate's 3D state reset started with Tegra114-only registers (0xe44,
+0x807, 0xc00-0xc53, 0xe70-0xe87). On Tegra20 the 3D unit stalls on the
+first of them: every job ended in a host1x CDMA timeout and a channel
+reset, about 1 s per job, while the pixels mostly still arrived. Write
+them only on Tegra114.
+
+Also drop the RD_DONE syncpoint before each draw (from opentegra's
+tgr3d_draw_primitives()): rendering is correct without it, and it made
+blended full-screen draws ~45% slower.
+
+Full-screen 1280x800 textured draw: 1248 ms -> 9.3 ms (copy),
+1075 ms -> 18 ms (premultiplied over).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/grate_draw.c | 66 ++++++++++++++------------
+ 1 file changed, 35 insertions(+), 31 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index b3dc5d6..f46de31 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -122,35 +122,40 @@ grate_init_state(struct grate_context *context)
+ 
+    grate_stream_push_setclass(stream, HOST1X_CLASS_GR3D);
+ 
+-   /* Tegra114 specific stuff */
+-   grate_stream_push(stream, host1x_opcode_imm(0xe44, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0x807, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc00, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc01, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc02, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc03, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc30, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc31, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc32, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc33, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc40, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc41, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc42, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc43, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc50, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc51, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc52, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xc53, 0x0000));
+-
+-   grate_stream_push(stream, host1x_opcode_incr(0xe70, 0x0010));
+-   for (int i = 0; i < 16; i++)
+-      grate_stream_push(stream, 0x00000000);
+-
+-   grate_stream_push(stream, host1x_opcode_imm(0xe80, 0x0f00));
+-   grate_stream_push(stream, host1x_opcode_imm(0xe84, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xe85, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xe86, 0x0000));
+-   grate_stream_push(stream, host1x_opcode_imm(0xe87, 0x0000));
++   /*
++    * Tegra114 specific stuff. On Tegra20 the 3D unit stalls on the 0xe44
++    * write (host1x CDMA timeout, ~1 s per job).
++    */
++   if (context->tegra114) {
++      grate_stream_push(stream, host1x_opcode_imm(0xe44, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0x807, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc00, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc01, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc02, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc03, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc30, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc31, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc32, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc33, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc40, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc41, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc42, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc43, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc50, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc51, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc52, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xc53, 0x0000));
++
++      grate_stream_push(stream, host1x_opcode_incr(0xe70, 0x0010));
++      for (int i = 0; i < 16; i++)
++         grate_stream_push(stream, 0x00000000);
++
++      grate_stream_push(stream, host1x_opcode_imm(0xe80, 0x0f00));
++      grate_stream_push(stream, host1x_opcode_imm(0xe84, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xe85, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xe86, 0x0000));
++      grate_stream_push(stream, host1x_opcode_imm(0xe87, 0x0000));
++   }
+ 
+    /* Tegra30 specific stuff */
+    grate_stream_push(stream, host1x_opcode_imm(0x907, 0));
+@@ -459,14 +464,13 @@ grate_draw_vbo(struct pipe_context *pcontext,
+ 
+    /*
+     * As opentegra's tgr3d_draw_primitives(): cache / internal state
+-    * maintenance, then wait until vertex and texture data have been read.
++    * maintenance. (Its RD_DONE sync after this only made draws slower.)
+     */
+    grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x1));
+    grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x1));
+    grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x2));
+    grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x3));
+    grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x3));
+-   grate_stream_sync(stream, DRM_TEGRA_SYNCPT_COND_RD_DONE);
+ 
+    assert(draws->count > 0 && draws->count < (1 << 11));
+    value  = TGR3D_VAL(DRAW_PRIMITIVES, INDEX_COUNT, draws->count - 1);
