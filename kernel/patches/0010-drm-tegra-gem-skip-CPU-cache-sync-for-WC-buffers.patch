@@ -1,0 +1,54 @@
+drm/tegra: gem: skip CPU cache sync when pinning DMA-API buffers
+
+Buffer objects without pages (no IOMMU, e.g. Tegra20 without GART) are
+allocated with dma_alloc_wc(), so the CPU only ever accesses them through
+a write-combined mapping and no cache lines can be dirty or stale. Still,
+every host1x job pin/unpin mapped them with dma_map_sgtable(..., 0), which
+cleans (on pin) and invalidates (on unpin) the whole buffer through L1 and
+the L2C-310. For the 4 MiB scanout or opentegra's 24 MiB pixmap pool that
+cost ~10 ms per job: ~85 % of CPU time during a 2D fill benchmark was
+v7_dma_clean_range/v7_dma_inv_range, capping GR2D at ~100 jobs/s.
+
+Map them with DMA_ATTR_SKIP_CPU_SYNC.
+
+diff --git a/drivers/gpu/drm/tegra/gem.c b/drivers/gpu/drm/tegra/gem.c
+index d2bae88ad..4df60d99e 100644
+--- a/drivers/gpu/drm/tegra/gem.c
++++ b/drivers/gpu/drm/tegra/gem.c
+@@ -56,6 +56,16 @@ static void tegra_bo_put(struct host1x_bo *bo)
+ 	drm_gem_object_put(&obj->gem);
+ }
+ 
++/*
++ * Buffers allocated with dma_alloc_wc() (no pages, not imported) are only
++ * accessed by the CPU through a write-combined mapping, so mapping them for
++ * a device needs no cache maintenance.
++ */
++static unsigned long tegra_bo_dma_attrs(struct tegra_bo *obj)
++{
++	return (!obj->pages && !obj->dma_buf) ? DMA_ATTR_SKIP_CPU_SYNC : 0;
++}
++
+ static struct host1x_bo_mapping *tegra_bo_pin(struct device *dev, struct host1x_bo *bo,
+ 					      enum dma_data_direction direction)
+ {
+@@ -129,7 +139,7 @@ static struct host1x_bo_mapping *tegra_bo_pin(struct device *dev, struct host1x_
+ 			goto free;
+ 	}
+ 
+-	err = dma_map_sgtable(dev, map->sgt, direction, 0);
++	err = dma_map_sgtable(dev, map->sgt, direction, tegra_bo_dma_attrs(obj));
+ 	if (err)
+ 		goto free_sgt;
+ 
+@@ -165,7 +175,9 @@ static void tegra_bo_unpin(struct host1x_bo_mapping *map)
+ 						  map->direction);
+ 		dma_buf_detach(map->attach->dmabuf, map->attach);
+ 	} else {
+-		dma_unmap_sgtable(map->dev, map->sgt, map->direction, 0);
++		struct tegra_bo *obj = host1x_to_tegra_bo(map->bo);
++
++		dma_unmap_sgtable(map->dev, map->sgt, map->direction, tegra_bo_dma_attrs(obj));
+ 		sg_free_table(map->sgt);
+ 		kfree(map->sgt);
+ 	}

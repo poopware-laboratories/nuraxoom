@@ -1,0 +1,4 @@
+# Sourced by tinydm-run-session before X11 sessions.
+# pmOS sets QT_QPA_PLATFORM=wayland globally (/etc/profile.d/qt-wayland.sh); Qt
+# desktops on X11 (LXQt) then fail with "Could not load the Qt platform plugin".
+export QT_QPA_PLATFORM=xcb

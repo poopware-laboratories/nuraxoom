@@ -1,16 +1,3 @@
-diff --git a/src/Makefile.am b/src/Makefile.am
-index e9486d7..6f5de43 100644
---- a/src/Makefile.am
-+++ b/src/Makefile.am
-@@ -46,7 +46,7 @@ opentegra_drv_la_CFLAGS += -pthread
- opentegra_drv_la_CFLAGS += -I$(srcdir)/tegradrm
- 
- # enable fp16 for the 3d vertex attributes
--opentegra_drv_la_CFLAGS += -mfp16-format=ieee
-+# clang: IEEE __fp16 by default
- 
- opentegra_drv_la_SOURCES = \
- 	compat-api.h \
 diff --git a/src/tegradrm/uapi_v3/strlcpy.c b/src/tegradrm/uapi_v3/strlcpy.c
 index fd7e653..f94d04b 100644
 --- a/src/tegradrm/uapi_v3/strlcpy.c
@@ -23,6 +10,22 @@ index fd7e653..f94d04b 100644
  /*
   * Copy src to string dst of size siz.  At most siz-1 characters
   * will be copied.  Always NUL terminates (unless siz == 0).
+diff --git a/src/tegradrm/uapi_v3/sync.c b/src/tegradrm/uapi_v3/sync.c
+index cd84fef..b807850 100644
+--- a/src/tegradrm/uapi_v3/sync.c
++++ b/src/tegradrm/uapi_v3/sync.c
+@@ -25,7 +25,10 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include "strlcpy.c"
+-#include "stdatomic.h"
++#include <stdatomic.h> /* GCC: the bundled one needs clang __c11 builtins */
++#ifndef ATOMIC_VAR_INIT
++#define ATOMIC_VAR_INIT(v) (v)
++#endif
+ #include "sync.h"
+ /* Prototypes for deprecated functions that used to be declared in the legacy
+  * android/sync.h. They've been moved here to make sure new code does not use
 diff --git a/src/tegradrm/uapi_v3/sync.h b/src/tegradrm/uapi_v3/sync.h
 index 76fa733..262c464 100644
 --- a/src/tegradrm/uapi_v3/sync.h

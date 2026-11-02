@@ -396,3 +396,46 @@ by the installer from /system. Not yet booted on hardware.
     asserts in libpulse and takes the whole session down.
   * CPU runs at 1 GHz always (no cpufreq for this board); custom Android
     kernels ran 1.4-1.5 GHz with raised voltage - possible opt-in later.
+
+## LXQt (2026-11-01, evening) - continue here
+- postmarketos-ui-lxqt installed on the owner's tablet; Phosh is still the
+  tinydm default. LXQt (X11 + Openbox) starts in ~7 s and uses ~166 MB RAM
+  (Phosh ~327 MB). Owner wants LXQt as default once polished.
+- Fixed: pmOS sets QT_QPA_PLATFORM=wayland globally -> LXQt on X11 died.
+  etc/tinydm.d/env-x11.d/80-nuraxoom-qt-xcb exports xcb (installed on tablet).
+- Onboard was missing (lxqt-tablet autostarts it but does not depend on it):
+  installed. Add onboard to the image if LXQt becomes default.
+- Open: icon theme Paper missing -> empty panel icons; owner wants Papirus
+  (papirus-icon-theme). Openbox theme Clearlooks-L looks bad; Arc installed
+  (check it ships openbox-3). The paper/arc install may have been cut off by
+  the shutdown below: run `doas apk fix` first.
+- Power button in LXQt = shutdown (that's how the tablet went off). Set it to
+  lock/nothing in lxqt-powermanagement (user + image default), not suspend.
+- Lowest backlight level flickers: give pwm-backlight a minimum level in the
+  DTS at the next kernel build.
+- CMA: 256 MB reserved, ~0.5 MB "free" even right after boot (probably lent to
+  movable pages). phoc once failed "DRM dumb buffer: Out of memory" after many
+  session restarts; a reboot fixed it. Watch.
+- apk still says "1 error" on some installs (another trigger): find it.
+
+## GPU: opentegra fixed and faster (2026-11-02)
+Full measurements and method: ../gpu/NOTES.md (outside this repo).
+- Root cause of "opentegra slower than modesetting": every host1x job pinned its
+  BOs with dma_map_sgtable(..., 0) = full cache clean on pin + invalidate on unpin
+  of the 4 MiB scanout / 24 MiB EXA pool, ~10 ms per job (perf: ~85 % CPU in
+  v7_dma_clean_range/v7_dma_inv_range). The BOs come from dma_alloc_wc(), so
+  kernel/patches/0010 maps them with DMA_ATTR_SKIP_CPU_SYNC. GR2D jobs/s 4-36x up.
+- The zig-built prebuilt/opentegra_drv.so used VFP d16-d31 (424 insns): SIGILL on
+  Tegra 2 (vfpv3d16) as soon as LXQt used compositing. Replaced by a native GCC
+  build: packages/xf86-video-opentegra/build.sh (-mfpu=vfpv3-d16, refuses d16-d31/
+  NEON), 0001-build-with-gcc-and-musl.patch. It also links lz4/turbojpeg/png
+  (pixmap compression): added lz4-libs, libturbojpeg, libpng to rootfs/packages.txt.
+- AccelCompositing now true (GR3D): blending 22 -> 506 ops/s (modesetting 61),
+  text 320 -> 2244 lines/s (modesetting 1144). Only tiny 10x10 RENDER rects got
+  slower (one GR3D job each).
+- Owner: Sxmo faster; LXQt + NetSurf faster; window moves almost tear-free.
+- Owner's tablet (live): boot partition = 0.4.1 + patch 0010 (backup
+  /home/user/boot-before-20261102-125848.img), this driver, compositing on, session
+  LXQt, /etc/nuraxoom/display = opentegra. Build tools + perf installed with apk.
+- Not done: a release with these (kernel rebuild via scripts/build-kernel.sh,
+  rootfs, zips); /etc/nuraxoom/display default is still modesetting.
