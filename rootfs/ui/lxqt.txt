@@ -1,0 +1,4 @@
+# LXQt (Openbox). Qt is forced to xcb by etc/tinydm.d/env-x11.d/80-nuraxoom-qt-xcb.
+postmarketos-ui-lxqt
+postmarketos-ui-lxqt-openrc
+screengrab

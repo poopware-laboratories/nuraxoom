@@ -1,0 +1,4 @@
+# Phosh (Wayland). Draws with pixman on the CPU: opentegra is X11 only.
+# Started by tinydm like the others (its greetd is not enabled).
+postmarketos-ui-phosh
+postmarketos-ui-phosh-openrc

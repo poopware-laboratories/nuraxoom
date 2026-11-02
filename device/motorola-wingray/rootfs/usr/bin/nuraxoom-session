@@ -1,19 +1,26 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
-# nuraxoom-session console|sxmo - choose what starts on boot (as root).
+# nuraxoom-session console|<desktop> - choose what starts on boot (as root).
 #   console  text console on tty1 with a touch keyboard
-#   sxmo     Sxmo (dwm, X11) through tinydm
+#   xfce, lxqt, mate, sxmo, phosh  that desktop through tinydm (if installed)
 # Takes effect on the next boot.
 set -e
+now=$(cat /etc/nuraxoom/session 2>/dev/null || echo unknown)
 case "$1" in
 console)
-	rc-update del tinydm default 2>/dev/null || true
-	echo console > /etc/nuraxoom/session ;;
-sxmo)
-	rc-update add tinydm default
-	echo sxmo > /etc/nuraxoom/session ;;
+	rc-update del tinydm default 2>/dev/null || true ;;
+phosh)
+	f=/usr/share/wayland-sessions/phosh.desktop ;;
+xfce|lxqt|mate|sxmo)
+	f=/usr/share/xsessions/$1.desktop ;;
 *)
-	echo "usage: nuraxoom-session console|sxmo (now: $(cat /etc/nuraxoom/session 2>/dev/null || echo sxmo))" >&2
+	echo "usage: nuraxoom-session console|xfce|lxqt|mate|sxmo|phosh (now: $now)" >&2
 	exit 1 ;;
 esac
+if [ "$1" != console ]; then
+	[ -e "$f" ] || { echo "$1 is not installed" >&2; exit 1; }
+	tinydm-set-session -f -s "$f" >/dev/null
+	rc-update add tinydm default
+fi
+echo "$1" > /etc/nuraxoom/session
 echo "session: $1 (reboot to apply)"

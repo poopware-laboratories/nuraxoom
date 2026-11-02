@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NuraXoom display check
+Comment=Mark the Xorg driver as working once the desktop is up
+Exec=/usr/libexec/nuraxoom/x-started
+OnlyShowIn=XFCE;LXQt;MATE;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,12 +1,11 @@
-# Package set of the NuraXoom image (installed with apk.static, see
+# Base package set of the NuraXoom image (installed with apk.static, see
 # rootfs/build-nura-rootfs.sh). One package per line, # comments allowed.
+# The desktops are added from rootfs/ui/*.txt (NURAXOOM_UI).
 
-# Nura / postmarketOS base and the stock pmOS Sxmo (dwm, X11) user interface
+# Nura / postmarketOS base
 alpine-base
 postmarketos-base
 postmarketos-base-openrc
-postmarketos-ui-sxmo-de-dwm
-postmarketos-ui-sxmo-de-dwm-openrc
 postmarketos-zram-openrc
 
 # Hardware support

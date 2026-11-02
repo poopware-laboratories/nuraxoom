@@ -7,7 +7,7 @@
 > bug reports about it.
 
 NuraXoom installs a full postmarketOS-style Linux system with the
-[Sxmo](https://sxmo.org) touch interface on a Motorola Xoom, next to Android.
+[Xfce](https://xfce.org) desktop on a Motorola Xoom, next to Android.
 Nothing is formatted: Linux lives in a folder on the Android data partition, and
 only the boot partition is replaced (your original one is backed up first).
 
@@ -16,12 +16,13 @@ only the boot partition is replaced (your original one is backed up first).
 | Works | Partly | Not yet |
 |---|---|---|
 | Touchscreen, rotation | Power button (see issues) | 5 GHz Wi-Fi |
-| Wi-Fi 2.4 GHz | Tegra 2D acceleration (optional, slower) | 3D acceleration |
+| Wi-Fi 2.4 GHz | | OpenGL (3D apps use the CPU) |
 | Bluetooth | | Cameras |
 | Speakers, volume keys | | Mobile data (MZ600/MZ602/MZ605 modem) |
 | Battery level and charging | | Firefox (CPU has no NEON) |
 | Brightness, USB networking + serial console | | Android in the boot menu |
-| Sxmo, MATE, Window Maker desktops | | |
+| Xfce, LXQt, MATE, Sxmo, Phosh desktops | | |
+| GPU-accelerated X11 drawing (opentegra) | | |
 
 Tested on an **MZ605** running the **MZ604 (wingray)** recovery. Other Xoom models
 (MZ600, MZ601, MZ602, MZ604, MZ606) should work the same way but are untested.
@@ -55,11 +56,15 @@ saved at install time (`/sdcard/NuraXoom/backup/boot-original.img`). Linux stays
 
 ## Using it
 
-* **Wi-Fi:** Sxmo menu → Networks (or `nmtui` in a terminal)
-* **Rotation:** follows the accelerometer; toggle in Sxmo → Config
-* **Other desktops:** `doas apk add mate-desktop-environment onboard`, then
-  `doas tinydm-set-session -f -s /usr/share/xsessions/mate.desktop` and reboot
-  (Onboard is an on-screen keyboard)
+* **Wi-Fi:** network icon in the panel (Sxmo: menu → Networks), or `nmtui`
+* **Rotation:** follows the accelerometer. To turn it off in Xfce/LXQt/MATE:
+  `mkdir -p ~/.config/nuraxoom && touch ~/.config/nuraxoom/autorotate.off`
+* **On-screen keyboard:** Onboard
+* **Other desktops:** images can include several (see *Building*); switch with
+  `doas nuraxoom-session xfce|lxqt|mate|sxmo|phosh|console` and reboot
+* **Display driver:** the Tegra 2 GPU driver (opentegra) is used by default and
+  falls back to plain modesetting if X fails to start twice;
+  `doas nuraxoom-display status|auto|opentegra|modesetting`
 * **Packages:** `doas apk update && doas apk add <name>`
 * **Logs:** `/sdcard/NuraXoom/logs` (also readable from TWRP)
 * **USB:** plugged into a computer, the tablet is `192.168.42.2` on a USB network
@@ -86,8 +91,11 @@ scripts/build-kernel.sh linux out/kernel
 # 2. Motorola Wi-Fi calibration, downloaded from an archived stock ROM
 scripts/fetch-firmware.sh out/firmware
 # 3. root filesystem, bootstrapped from the Nura and Alpine repositories (as root)
-sudo rootfs/build-nura-rootfs.sh out/kernel/modules out/firmware out/nura-rootfs.tar.gz \
-    packages/xf86-video-opentegra/prebuilt/opentegra_drv.so
+#    NURAXOOM_UI picks the desktops: xfce (default), lxqt, mate, sxmo, phosh,
+#    several ("xfce,sxmo") or all; the first one starts on boot
+#    (NURAXOOM_SESSION overrides, "console" = text console)
+sudo NURAXOOM_UI=xfce rootfs/build-nura-rootfs.sh out/kernel/modules out/firmware \
+    out/nura-rootfs.tar.gz packages/xf86-video-opentegra/prebuilt/opentegra_drv.so
 # 4. boot image (xoomboot) and the TWRP zips
 #    (busybox.static: /bin/busybox.static from the rootfs)
 boot/build-boot.sh out/kernel/zImage out/kernel/tegra20-motorola-mz605.dtb busybox.static 0.4.0 out/boot.img

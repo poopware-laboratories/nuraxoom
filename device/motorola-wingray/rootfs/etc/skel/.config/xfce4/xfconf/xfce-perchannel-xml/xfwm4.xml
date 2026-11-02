@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- NuraXoom: sync compositor redraws with the Present extension, never
+     OpenGL (Tegra 2 has no GL driver; Mesa would fall back to llvmpipe). -->
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="vblank_mode" type="string" value="xpresent"/>
+  </property>
+</channel>

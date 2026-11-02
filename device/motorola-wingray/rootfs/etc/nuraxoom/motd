@@ -1,5 +1,6 @@
   Nura on Motorola Xoom - community device port (NuraXoom), not an official Nura release
-  Wi-Fi ............. Sxmo > Networks   (or: nmtui)
+  Wi-Fi ............. network icon in the panel (Sxmo: Networks), or nmtui
+  Desktop ........... doas nuraxoom-session xfce|lxqt|mate|sxmo|phosh|console
   Display driver .... nuraxoom-display status|auto|opentegra|modesetting
   Logs .............. /sdcard/NuraXoom/logs  (also readable from TWRP)
   Android storage ... ~/sdcard  (/mnt/userdata/media/0)

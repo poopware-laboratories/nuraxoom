@@ -1,0 +1,8 @@
+# Xfce (the default desktop): lightest of Xfce/LXQt/MATE on the Xoom
+# (~300 MB used after login, owner's pick 2026-11-02).
+xfce4
+xfce4-terminal
+xfce4-screenshooter
+xfce4-power-manager
+xfce4-pulseaudio-plugin
+xfce4-whiskermenu-plugin
