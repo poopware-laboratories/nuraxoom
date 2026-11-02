@@ -396,3 +396,24 @@ by the installer from /system. Not yet booted on hardware.
     asserts in libpulse and takes the whole session down.
   * CPU runs at 1 GHz always (no cpufreq for this board); custom Android
     kernels ran 1.4-1.5 GHz with raised voltage - possible opt-in later.
+
+## LXQt (2026-11-01, evening) - continue here
+- postmarketos-ui-lxqt installed on the owner's tablet; Phosh is still the
+  tinydm default. LXQt (X11 + Openbox) starts in ~7 s and uses ~166 MB RAM
+  (Phosh ~327 MB). Owner wants LXQt as default once polished.
+- Fixed: pmOS sets QT_QPA_PLATFORM=wayland globally -> LXQt on X11 died.
+  etc/tinydm.d/env-x11.d/80-nuraxoom-qt-xcb exports xcb (installed on tablet).
+- Onboard was missing (lxqt-tablet autostarts it but does not depend on it):
+  installed. Add onboard to the image if LXQt becomes default.
+- Open: icon theme Paper missing -> empty panel icons; owner wants Papirus
+  (papirus-icon-theme). Openbox theme Clearlooks-L looks bad; Arc installed
+  (check it ships openbox-3). The paper/arc install may have been cut off by
+  the shutdown below: run `doas apk fix` first.
+- Power button in LXQt = shutdown (that's how the tablet went off). Set it to
+  lock/nothing in lxqt-powermanagement (user + image default), not suspend.
+- Lowest backlight level flickers: give pwm-backlight a minimum level in the
+  DTS at the next kernel build.
+- CMA: 256 MB reserved, ~0.5 MB "free" even right after boot (probably lent to
+  movable pages). phoc once failed "DRM dumb buffer: Out of memory" after many
+  session restarts; a reboot fixed it. Watch.
+- apk still says "1 error" on some installs (another trigger): find it.
