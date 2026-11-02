@@ -439,3 +439,10 @@ Full measurements and method: ../gpu/NOTES.md (outside this repo).
   LXQt, /etc/nuraxoom/display = opentegra. Build tools + perf installed with apk.
 - Not done: a release with these (kernel rebuild via scripts/build-kernel.sh,
   rootfs, zips); /etc/nuraxoom/display default is still modesetting.
+- 3D job merging (2026-11-02, later): packages/xf86-video-opentegra/0002 ports
+  opentegra's draw batching (optimizations_3d.c, GRATE-kernel only before) to the
+  upstream UAPI: the v1 stream gets a pending job fence. Enabled with Option
+  "Merge3DJobs" (default off in the driver, on in nuraxoom-opentegra.conf).
+  3D jobs 24925 -> 1731 per benchmark run; tiny blended rects 7.6k -> 19.3k/s,
+  blend 500x500 503 -> 1626/s, text 1952 -> 2649 lines/s. ../gpu/xbench
+  `--verify` checksums are identical with merge on/off. Owner: LXQt + NetSurf fine.

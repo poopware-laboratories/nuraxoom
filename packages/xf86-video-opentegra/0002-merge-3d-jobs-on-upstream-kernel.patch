@@ -1,0 +1,195 @@
+diff --git a/src/driver.c b/src/driver.c
+index a104986..7de5b0c 100644
+--- a/src/driver.c
++++ b/src/driver.c
+@@ -51,6 +51,7 @@ typedef enum
+     OPTION_EXA_COMPRESSION_JPEG_QUALITY,
+     OPTION_EXA_COMPRESSION_PNG,
+     OPTION_EXA_ERASE_PIXMAPS,
++    OPTION_EXA_MERGE_3D_JOBS,
+ } TegraOptions;
+ 
+ static const OptionInfoRec Options[] = {
+@@ -65,6 +66,7 @@ static const OptionInfoRec Options[] = {
+     { OPTION_EXA_COMPRESSION_JPEG_QUALITY, "JPEGCompressionQuality", OPTV_INTEGER, { 0 }, FALSE },
+     { OPTION_EXA_COMPRESSION_PNG, "DisableCompressionPNG", OPTV_BOOLEAN, { 0 }, FALSE },
+     { OPTION_EXA_ERASE_PIXMAPS, "SecureErasePixmaps", OPTV_BOOLEAN, { 0 }, FALSE },
++    { OPTION_EXA_MERGE_3D_JOBS, "Merge3DJobs", OPTV_BOOLEAN, { 0 }, FALSE },
+     { -1, NULL, OPTV_NONE, { 0 }, FALSE }
+ };
+ 
+@@ -422,6 +424,19 @@ TegraPreInit(ScrnInfoPtr pScrn, int flags)
+                   "EXA Compositing: enabled %s\n",
+                    tegra->exa_compositing ? "YES" : "NO");
+ 
++        /*
++         * Batch 3d draws into one host1x job on the upstream kernel too
++         * (the GRATE kernel always does). Off by default: needs the v1
++         * stream's pending job fence.
++         */
++        tegra->exa_merge_3d_jobs = xf86ReturnOptValBool(tegra->Options,
++                                                        OPTION_EXA_MERGE_3D_JOBS,
++                                                        FALSE);
++
++        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
++                  "EXA merge 3d jobs: enabled %s\n",
++                   tegra->exa_merge_3d_jobs ? "YES" : "NO");
++
+         tegra->exa_pool_alloc = !xf86ReturnOptValBool(tegra->Options,
+                                                       OPTION_EXA_POOL_ALLOC,
+                                                       FALSE);
+diff --git a/src/driver.h b/src/driver.h
+index 674e783..525726e 100644
+--- a/src/driver.h
++++ b/src/driver.h
+@@ -194,6 +194,7 @@ typedef struct _TegraRec
+     Bool exa_refrigerator;
+     Bool exa_pool_alloc;
+     Bool exa_compositing;
++    Bool exa_merge_3d_jobs;
+     Bool exa_enabled;
+ 
+     unsigned int pinned_mem_size;
+diff --git a/src/exa/optimizations_3d.c b/src/exa/optimizations_3d.c
+index 5d60bc4..28d443b 100644
+--- a/src/exa/optimizations_3d.c
++++ b/src/exa/optimizations_3d.c
+@@ -528,7 +528,7 @@ tegra_exa_optimize_3d_submission(struct tegra_3d_state *state)
+ 
+     /* upstream kernel driver doesn't support cmdstream synchronization */
+     drm_ver = drm_tegra_version(scratch->drm);
+-    if (drm_ver < GRATE_KERNEL_DRM_VERSION) {
++    if (drm_ver < GRATE_KERNEL_DRM_VERSION && !exa->tegra->exa_merge_3d_jobs) {
+         DEBUG_MSG("optimization unsupported\n");
+         return NULL;
+     }
+diff --git a/src/gpu/tegra_stream_v1.c b/src/gpu/tegra_stream_v1.c
+index 702aa5f..8c42d5f 100644
+--- a/src/gpu/tegra_stream_v1.c
++++ b/src/gpu/tegra_stream_v1.c
+@@ -52,6 +52,13 @@ struct tegra_stream_v1 {
+     struct drm_tegra_job *job;
+     struct tegra_command_buffer_v1 buffer;
+     struct xorg_list held_fences;
++
++    /*
++     * job_fence is created by tegra_stream_get_current_fence_v1() while the
++     * job is still being constructed (deferred 3d jobs). It has no DRM fence
++     * until the job is submitted, then it becomes the job's fence.
++     */
++    struct tegra_fence *job_fence;
+ };
+ 
+ static struct tegra_fence *
+@@ -97,6 +104,12 @@ static int tegra_stream_cleanup_v1(struct tegra_stream *base_stream)
+     stream->job = NULL;
+     stream->base.status = TEGRADRM_STREAM_FREE;
+ 
++    if (stream->job_fence) {
++        TEGRA_FENCE_MARK_COMPLETED(stream->job_fence);
++        TEGRA_FENCE_PUT(stream->job_fence);
++        stream->job_fence = NULL;
++    }
++
+     return 0;
+ }
+ 
+@@ -138,6 +151,7 @@ static int tegra_stream_flush_v1(struct tegra_stream *base_stream,
+     drm_tegra_fence_free(fence);
+ 
+ cleanup:
++    /* the job is done (or failed): tegra_stream_cleanup_v1() completes job_fence */
+     tegra_stream_cleanup_v1(base_stream);
+ 
+     return ret;
+@@ -172,12 +186,34 @@ tegra_stream_submit_v1(enum host1x_engine engine,
+         TEGRA_FENCE_PUT(stream->base.last_fence[engine]);
+         stream->base.last_fence[engine] = f = NULL;
+         ret = -1;
++
++        if (stream->job_fence) {
++            TEGRA_FENCE_MARK_COMPLETED(stream->job_fence);
++            TEGRA_FENCE_PUT(stream->job_fence);
++            stream->job_fence = NULL;
++        }
+     } else {
+         struct tegra_fence_v1 *f_v1, *tmp_v1;
+ 
+         xorg_list_for_each_entry_safe(f_v1, tmp_v1, &stream->held_fences, entry)
+             TEGRA_FENCE_FINISH(&f_v1->base);
+ 
++        if (stream->job_fence) {
++            f = stream->job_fence;
++            stream->job_fence = NULL;
++
++            f_v1 = to_fence_v1(f);
++            f_v1->fence = fence;
++            f_v1->job = stream->job;
++            xorg_list_append(&f_v1->entry, &stream->held_fences);
++
++            TEGRA_FENCE_PUT(stream->base.last_fence[engine]);
++            TEGRA_FENCE_SET_ACTIVE(f);
++
++            stream->base.last_fence[engine] = f;
++            goto done;
++        }
++
+         f = tegra_stream_create_fence_v1(stream, fence, engine == TEGRA_2D);
+         if (f) {
+             TEGRA_FENCE_PUT(stream->base.last_fence[engine]);
+@@ -275,7 +311,8 @@ static bool tegra_stream_free_fence_v1(struct tegra_fence *base_fence)
+         tegra_fences_destroyed++;
+ #endif
+         drm_tegra_fence_free(f->fence);
+-        drm_tegra_job_free(f->job);
++        if (f->job)
++            drm_tegra_job_free(f->job);
+         xorg_list_del(&f->entry);
+         free(f);
+ 
+@@ -312,7 +349,8 @@ tegra_stream_create_fence_v1(struct tegra_stream_v1 *stream,
+         return NULL;
+ 
+     f->fence = fence;
+-    f->job = stream->job;
++    f->job = fence ? stream->job : NULL;
++    xorg_list_init(&f->entry);
+     f->base.check_fence = tegra_stream_check_fence_v1;
+     f->base.wait_fence = tegra_stream_wait_fence_v1;
+     f->base.free_fence = tegra_stream_free_fence_v1;
+@@ -328,7 +366,8 @@ tegra_stream_create_fence_v1(struct tegra_stream_v1 *stream,
+     tegra_fences_created++;
+ #endif
+ 
+-    xorg_list_append(&f->entry, &stream->held_fences);
++    if (fence)
++        xorg_list_append(&f->entry, &stream->held_fences);
+ 
+     return &f->base;
+ }
+@@ -498,8 +537,23 @@ static int tegra_stream_sync_v1(struct tegra_stream *base_stream,
+ static struct tegra_fence *
+ tegra_stream_get_current_fence_v1(struct tegra_stream *base_stream)
+ {
+-    /* upstream kernel driver doesn't support advanced synchronization */
+-    return NULL;
++    struct tegra_stream_v1 *stream = to_stream_v1(base_stream);
++
++    /*
++     * Upstream kernel has no in-stream synchronization, so the returned
++     * fence is the final fence of the whole job. Users must flush the
++     * deferred job before waiting on it (the EXA optimizations do).
++     */
++    if (!stream->job_fence) {
++        stream->job_fence = tegra_stream_create_fence_v1(stream, NULL,
++                        stream->base.class_id == HOST1X_CLASS_GR2D);
++        if (!stream->job_fence)
++            return NULL;
++
++        stream->job_fence->seqno = base_stream->fence_seqno++;
++    }
++
++    return stream->job_fence;
+ }
+ 
+ int tegra_stream_create_v1(struct tegra_stream **pstream,
