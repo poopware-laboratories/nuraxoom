@@ -110,7 +110,8 @@ Layout:
 Our scripts, xoomboot and device files: GPL-2.0-or-later (see `LICENSE`). Kernel
 patches and device tree: GPL-2.0, like the kernel. `tools/mkbootimg.py` is MIT.
 The bundled `opentegra_drv.so` is built from
-[xf86-video-opentegra](https://github.com/grate-driver/xf86-video-opentegra) (MIT).
+[xf86-video-opentegra](https://github.com/grate-driver/xf86-video-opentegra) (MIT)
+with `packages/xf86-video-opentegra/build.sh` (native Alpine armv7 build).
 Motorola firmware is not included; it's fetched at build or install time.
 
 ## Thanks

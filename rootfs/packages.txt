@@ -17,6 +17,10 @@ alsa-utils
 bluez
 iio-sensor-proxy
 xf86-input-libinput
+# libraries the bundled opentegra_drv.so links (pixmap compression)
+lz4-libs
+libturbojpeg
+libpng
 iw
 
 # Text console fallback (on-screen keyboard on tty1)

@@ -1,5 +1,6 @@
-# Xorg driver for the Sxmo session: auto | opentegra | modesetting
-# modesetting is what has been verified on the tablet (0.2.x); opentegra untested.
+# Xorg driver for X11 sessions (Sxmo, LXQt): auto | opentegra | modesetting
+# opentegra (GPU 2D/3D EXA) is faster with kernel patch 0010 and was
+# tested in Sxmo and LXQt; modesetting is the long-verified fallback.
 # auto = try Tegra 2D acceleration, fall back to modesetting if X fails twice.
 # Change with: nuraxoom-display <mode>
 modesetting
