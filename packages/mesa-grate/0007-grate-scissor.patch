@@ -1,0 +1,70 @@
+From 70a0e0d79b088bfefedea76ec263784e5c668e16 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:30:00 -0300
+Subject: [PATCH 7/9] grate: scissor
+
+set_scissor_states was a stub and the scissor registers always covered
+the whole framebuffer. wlroots limits each redraw to the damaged
+regions with the scissor, so without it every damage rectangle redrew
+whole surfaces.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/grate_context.h |  1 +
+ src/gallium/drivers/grate/grate_state.c   | 24 ++++++++++++++++++++---
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_context.h b/src/gallium/drivers/grate/grate_context.h
+index b7c2900..b38ade0 100644
+--- a/src/gallium/drivers/grate/grate_context.h
++++ b/src/gallium/drivers/grate/grate_context.h
+@@ -50,6 +50,7 @@ struct grate_context {
+    struct pipe_sampler_state *fragment_samplers[PIPE_MAX_SAMPLERS];
+ 
+    uint32_t no_scissor[3];
++   struct pipe_scissor_state scissor;
+    uint32_t viewport[10];
+    uint32_t guardband[4];
+    bool y_invert;
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index b048e6c..baefa04 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -112,8 +112,8 @@ grate_set_scissor_states(struct pipe_context *pcontext,
+                          unsigned num_scissors,
+                          const struct pipe_scissor_state * scissors)
+ {
+-   assert(num_scissors == 1);
+-   unimplemented();
++   assert(start_slot == 0 && num_scissors == 1);
++   grate_context(pcontext)->scissor = scissors[0];
+ }
+ 
+ static void
+@@ -655,7 +655,25 @@ static void
+ emit_scissor(struct grate_context *context)
+ {
+    struct grate_stream *stream = &context->gr3d->stream;
+-   grate_stream_push_words(stream, context->no_scissor, 3, 0);
++   const struct pipe_scissor_state *s = &context->scissor;
++   unsigned w = context->framebuffer.base.width;
++   unsigned h = context->framebuffer.base.height;
++
++   if (!context->rast->base.scissor) {
++      grate_stream_push_words(stream, context->no_scissor, 3, 0);
++      return;
++   }
++
++   /*
++    * Gallium's scissor is in framebuffer rows from the top, which is how
++    * grate's viewport maps rows into memory too (render targets aren't
++    * bottom-up).
++    */
++   grate_stream_push(stream, host1x_opcode_incr(TGR3D_SCISSOR_HORIZ, 2));
++   grate_stream_push(stream, TGR3D_VAL(SCISSOR_HORIZ, MIN, MIN2(s->minx, w)) |
++                             TGR3D_VAL(SCISSOR_HORIZ, MAX, MIN2(s->maxx, w)));
++   grate_stream_push(stream, TGR3D_VAL(SCISSOR_VERT, MIN, MIN2(s->miny, h)) |
++                             TGR3D_VAL(SCISSOR_VERT, MAX, MIN2(s->maxy, h)));
+ }
+ 
+ static void

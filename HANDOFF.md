@@ -446,3 +446,23 @@ Full measurements and method: ../gpu/NOTES.md (outside this repo).
   3D jobs 24925 -> 1731 per benchmark run; tiny blended rects 7.6k -> 19.3k/s,
   blend 500x500 503 -> 1626/s, text 1952 -> 2649 lines/s. ../gpu/xbench
   `--verify` checksums are identical with merge on/off. Owner: LXQt + NetSurf fine.
+
+## Phosh on the GPU with grate Mesa (2026-11-02, experimental)
+
+- packages/mesa-grate: grate's Mesa (Gallium "grate") with eleven NuraXoom
+  patches so that phoc (Phosh's compositor) draws with wlroots' GLES2 renderer
+  on the Tegra 2 GPU. See packages/mesa-grate/README.md; full log in
+  gpu/NOTES.md of the workspace.
+- grate needed more than expected on the upstream kernel: dma-buf sharing,
+  vertex shader constants, draw offsets, depth function, no Tegra114 registers
+  (the 3D unit stalled ~1 s per job on them), no bottom-up buffers (flipped
+  screen), textures and blending via hand-written programs for wlroots' three
+  fragment shaders, scissor, one job per frame.
+- Full-screen 1280x800 on the GPU: copy 5.4 ms, blended 8.5 ms; uploading a
+  redrawn full-screen surface ~9 ms (memory-bound). Phosh and apps still draw
+  with cairo on the CPU; only compositing is on the GPU.
+- Not in the images. On the owner's tablet: /opt/mesa-grate,
+  /usr/libexec/nuraxoom/phoc-gpu, ~/.phoshdebug (COMPOSITOR=phoc-gpu), tinydm
+  session Phosh. Owner: faster than software phoc.
+- Open: each phoc exit leaves ~8 MB of CMA allocated in the kernel; no
+  console fallback when the session keeps failing; Catacomb (Smithay) next.

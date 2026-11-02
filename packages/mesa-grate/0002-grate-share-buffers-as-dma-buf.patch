@@ -1,0 +1,113 @@
+From 0b58d865c42b84a853df4ba2c882e02cd539b8a0 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:00:00 -0300
+Subject: [PATCH 2/5] grate: share buffers as dma-buf
+
+wlroots (phoc) and Wayland EGL clients exchange buffers as dma-buf file
+descriptors. grate could only export flink names and KMS handles and
+imported flink names whatever the handle type was asked for.
+
+- resource_get_handle: export WINSYS_HANDLE_TYPE_FD; report offset 0 and
+  DRM_FORMAT_MOD_LINEAR (grate never tiles).
+- resource_from_handle: import FD handles; honour the handle type; refuse
+  modifiers other than LINEAR and non-zero offsets.
+- drm_tegra_bo_from_dmabuf: rewind with SEEK_SET. dma-buf llseek only
+  accepts SEEK_END and SEEK_SET, so SEEK_CUR left errno at EINVAL and every
+  import failed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/drm/tegra.c      |  3 +-
+ src/gallium/drivers/grate/grate_resource.c | 45 ++++++++++++++++++++--
+ 2 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/drm/tegra.c b/src/gallium/drivers/grate/drm/tegra.c
+index 1fd336c..0048acb 100644
+--- a/src/gallium/drivers/grate/drm/tegra.c
++++ b/src/gallium/drivers/grate/drm/tegra.c
+@@ -902,7 +902,8 @@ int drm_tegra_bo_from_dmabuf(struct drm_tegra_bo **bop, struct drm_tegra *drm,
+ 	errno = 0;
+ 	/* lseek() to get bo size */
+ 	size = lseek(fd, 0, SEEK_END);
+-	lseek(fd, 0, SEEK_CUR);
++	/* dma-buf llseek only accepts SEEK_END and SEEK_SET */
++	lseek(fd, 0, SEEK_SET);
+ 	/* store lseek() error number */
+ 	err = -errno;
+ 
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index f632d99..a661322 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -1,5 +1,7 @@
++#include <errno.h>
+ #include <stdio.h>
+ 
++#include "drm-uapi/drm_fourcc.h"
+ #include "util/format/u_format.h"
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+@@ -53,12 +55,21 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
+          fprintf(stderr, "drm_tegra_bo_get_handle() failed: %d\n", err);
+          return FALSE;
+       }
++   } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
++      err = drm_tegra_bo_to_dmabuf(resource->bo, &handle->handle);
++      if (err < 0) {
++         fprintf(stderr, "drm_tegra_bo_to_dmabuf() failed: %d\n", err);
++         return FALSE;
++      }
+    } else {
+       fprintf(stdout, "unsupported handle type: %d\n", handle->type);
+       return FALSE;
+    }
+ 
+    handle->stride = resource->pitch;
++   handle->offset = 0;
++   /* grate never tiles (resource->tiled is always 0) */
++   handle->modifier = DRM_FORMAT_MOD_LINEAR;
+    return TRUE;
+ }
+ 
+@@ -229,10 +240,38 @@ grate_screen_resource_from_handle(struct pipe_screen *pscreen,
+    pipe_reference_init(&resource->b.reference, 1);
+    resource->b.screen = pscreen;
+ 
+-   err = drm_tegra_bo_from_name(&resource->bo, screen->drm,
+-                                handle->handle, 0);
++   if (handle->modifier != DRM_FORMAT_MOD_INVALID &&
++       handle->modifier != DRM_FORMAT_MOD_LINEAR) {
++      FREE(resource);
++      return NULL;
++   }
++
++   switch (handle->type) {
++   case WINSYS_HANDLE_TYPE_SHARED:
++      err = drm_tegra_bo_from_name(&resource->bo, screen->drm,
++                                   handle->handle, 0);
++      break;
++   case WINSYS_HANDLE_TYPE_FD:
++      err = drm_tegra_bo_from_dmabuf(&resource->bo, screen->drm,
++                                     handle->handle, 0);
++      break;
++   default:
++      fprintf(stderr, "unsupported handle type: %d\n", handle->type);
++      err = -EINVAL;
++      break;
++   }
+    if (err < 0) {
+-      fprintf(stderr, "drm_tegra_bo_from_name() failed: %d\n", err);
++      fprintf(stderr, "importing BO (type %d) failed: %d\n",
++              handle->type, err);
++      FREE(resource);
++      return NULL;
++   }
++
++   /* the driver addresses BOs from their start */
++   if (handle->offset) {
++      fprintf(stderr, "BO import with offset %u unsupported\n",
++              handle->offset);
++      drm_tegra_bo_unref(resource->bo);
+       FREE(resource);
+       return NULL;
+    }

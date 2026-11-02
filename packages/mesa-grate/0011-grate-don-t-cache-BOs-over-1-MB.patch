@@ -1,0 +1,48 @@
+From caf68ef03b681fe485789857712f764b7b9bf8b1 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:45:00 -0300
+Subject: [PATCH 11/11] grate: don't cache BOs over 1 MB
+
+Tegra20 has no IOMMU, so every BO is CMA (256 MB on the Xoom), shared by
+the display and all GPU clients. The BO cache kept freed BOs of any size
+for up to 60 s, which held window-sized buffers a compositor rarely
+reallocates out of reach of everyone else. Free BOs over 1 MB right away
+and keep only small ones (<= 64 KB) longer than a second.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/drm/tegra_bo_cache.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/drm/tegra_bo_cache.c b/src/gallium/drivers/grate/drm/tegra_bo_cache.c
+index 542ab97..9e202e8 100644
+--- a/src/gallium/drivers/grate/drm/tegra_bo_cache.c
++++ b/src/gallium/drivers/grate/drm/tegra_bo_cache.c
+@@ -131,8 +131,9 @@ void drm_tegra_bo_cache_cleanup(struct drm_tegra *drm, time_t time)
+ 			if (time && delta <= 1)
+ 				break;
+ 
+-			/* keep things in cache longer if not much */
+-			if (time && delta < 60 && bucket->num_entries < 5)
++			/* keep things in cache longer if not much (small BOs) */
++			if (time && delta < 60 && bucket->num_entries < 5 &&
++			    bucket->size <= 65536)
+ 				break;
+ 
+ 			VG_BO_OBTAIN(bo);
+@@ -282,6 +283,15 @@ int drm_tegra_bo_cache_free(struct drm_tegra_bo *bo)
+ 	struct drm_tegra *drm = bo->drm;
+ 	struct drm_tegra_bo_bucket *bucket;
+ 
++	/*
++	 * Tegra20 has no IOMMU: every BO is CMA (256 MB on the Xoom, shared
++	 * with the display and every GPU client). Window-sized buffers are
++	 * rarely reallocated by a compositor, so caching them mostly kept
++	 * tens of MB of CMA out of reach of other processes; free them.
++	 */
++	if (bo->size > 1024 * 1024)
++		return -1;
++
+ 	/* see if we can be green and recycle: */
+ 	bucket = drm_tegra_get_bucket(drm, bo->size);
+ 	if (bucket) {

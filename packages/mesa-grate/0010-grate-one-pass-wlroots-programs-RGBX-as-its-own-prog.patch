@@ -1,0 +1,643 @@
+From 407056b21d8b90a8e1ad191fdba46d2c8cbe9254 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:45:00 -0300
+Subject: [PATCH 10/11] grate: one-pass wlroots programs, RGBX as its own
+ program
+
+The premultiplied "over" programs took two passes through the fragment
+pipeline (sample and multiply, then fetch the destination and blend).
+PSEQ fetches the destination pixel at the start of an EXEC and TEX runs
+after the interpolation in the same EXEC, so do both in one pass: the
+texel goes to r0,r1, the destination to r2,r3, and two ALU steps compute
+dst * (1 - src.a * alpha) + src * alpha (alpha via the "r3.h - 1"
+operand). Solid "over" gets 1 - colour.a from the CPU in u2.l.
+
+The per-pixel red/blue swap selects are gone: grate only samples
+B8G8R8A8/X8 into B8G8R8A8/X8 targets, so they never swapped. RGBX
+textures get their own programs instead of a per-pixel select.
+
+Full-screen 1280x800: copy 9.3 -> 5.4 ms, over 18 -> 8.5 ms,
+solid 5.8 -> 3.7 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/fp/wlr/README       |  12 +-
+ .../drivers/grate/fp/wlr/solid_over.asm       |  28 +-
+ src/gallium/drivers/grate/fp/wlr/tex.asm      |  18 +-
+ src/gallium/drivers/grate/fp/wlr/tex_over.asm |  47 ++-
+ src/gallium/drivers/grate/fp/wlr/tex_rgbx.asm |  22 ++
+ .../drivers/grate/fp/wlr/tex_rgbx_over.asm    |  31 ++
+ .../drivers/grate/fp/wlr/wlr_programs.h       | 272 ++++++++++++------
+ src/gallium/drivers/grate/grate_wlr.c         |   7 +-
+ 8 files changed, 276 insertions(+), 161 deletions(-)
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/tex_rgbx.asm
+ create mode 100644 src/gallium/drivers/grate/fp/wlr/tex_rgbx_over.asm
+
+diff --git a/src/gallium/drivers/grate/fp/wlr/README b/src/gallium/drivers/grate/fp/wlr/README
+index 7f4797b..31011ea 100644
+--- a/src/gallium/drivers/grate/fp/wlr/README
++++ b/src/gallium/drivers/grate/fp/wlr/README
+@@ -4,12 +4,14 @@ syntax. grate's TGSI fragment compiler only handles MOV, so
+ grate_create_fs_state() recognises these TGSI shapes and uses the programs
+ below instead. Tegra20 blends in the fragment program, so each comes in a
+ "blending off" and a premultiplied "over" (ONE, ONE_MINUS_SRC_ALPHA) form.
++Each runs in one pass: the "over" forms fetch the destination pixel (PSEQ,
++into r2,r3) in the same EXEC that samples the texture (into r0,r1).
++Textures and render targets are both B8G8R8A8/X8 (grate samples nothing
++else), so bytes go through in memory order.
+ 
+ Uniforms (fx10 halves, 1.0 = 256):
+-  u0.l u0.h u1.l u1.h  solid: colour in render-target byte order
+-                       tex:   alpha, alpha, alpha, alpha
+-  u2.l                 tex: 1.0 = ignore texture alpha (RGBX)
+-  u2.h                 tex: 1.0 = swap bytes 0 and 2 (RGBA texture,
+-                       BGRA target or the other way round)
++  u0.l u0.h u1.l u1.h  solid: colour in render-target byte order (b g r a)
++                       tex*:  alpha, alpha, alpha, alpha
++  u2.l                 solid_over: 1 - colour.a; tex_rgbx_over: 1 - alpha
+ 
+ Rebuild wlr_programs.h with NuraXoom's packages/mesa-grate/gen-wlr-fp.sh.
+diff --git a/src/gallium/drivers/grate/fp/wlr/solid_over.asm b/src/gallium/drivers/grate/fp/wlr/solid_over.asm
+index dbd022a..debd563 100644
+--- a/src/gallium/drivers/grate/fp/wlr/solid_over.asm
++++ b/src/gallium/drivers/grate/fp/wlr/solid_over.asm
+@@ -1,32 +1,24 @@
+-// dst = colour + dst * (1 - colour.a)   (premultiplied over)
+-pseq_to_dw_exec_nb = 2
++// dst = colour + dst * (1 - colour.a)   (premultiplied over), one pass
++// u2.l = 1 - colour.a, worked out on the CPU
++pseq_to_dw_exec_nb = 1
+ alu_buffer_size = 1
+ 
+ .asm
+ 
+ EXEC
++	// fetch dst pixel to r2,r3
++	PSEQ:	0x0081000A
++
+ 	MFU:	sfu:  rcp r4
+ 		mul0: bar, sfu, bar0
+ 		mul1: bar, sfu, bar1
+ 		ipl:  t0.fp20, t0.fp20, NOP, NOP
+-;
+-
+-EXEC
+-	// fetch dst pixel to r2,r3
+-	PSEQ:	0x0081000A
+-
+-	// tmp = -colour.a * dst + dst
+-	ALU:
+-		ALU0:	MAD  lp.lh, -u1.h, r2.l, r2.l
+-		ALU1:	MAD  lp.lh, -u1.h, r2.h, r2.h
+-		ALU2:	MAD  lp.lh, -u1.h, r3.l, r3.l
+-		ALU3:	MAD  lp.lh, -u1.h, r3.h, r3.h
+ 
+ 	ALU:
+-		ALU0:	MAD  r0.l, u0.l, #1, alu0 (sat)
+-		ALU1:	MAD  r0.h, u0.h, #1, alu1 (sat)
+-		ALU2:	MAD  r1.l, u1.l, #1, alu2 (sat)
+-		ALU3:	MAD  r1.h, u1.h, #1, alu3 (sat)
++		ALU0:	MAD  r0.l, r2.l, u2.l, u0.l (sat)
++		ALU1:	MAD  r0.h, r2.h, u2.l, u0.h (sat)
++		ALU2:	MAD  r1.l, r3.l, u2.l, u1.l (sat)
++		ALU3:	MAD  r1.h, r3.h, u2.l, u1.h (sat)
+ 
+ 	DW:	store rt1, r0, r1
+ ;
+diff --git a/src/gallium/drivers/grate/fp/wlr/tex.asm b/src/gallium/drivers/grate/fp/wlr/tex.asm
+index 8dfdd02..2ad008b 100644
+--- a/src/gallium/drivers/grate/fp/wlr/tex.asm
++++ b/src/gallium/drivers/grate/fp/wlr/tex.asm
+@@ -10,21 +10,13 @@ EXEC
+ 		mul1: bar, sfu, bar1
+ 		ipl:  t0.fp20, t0.fp20, NOP, NOP
+ 
+-	TEX:	tex r2, r3, tex0, r0, r1, r2
++	TEX:	tex r0, r1, tex0, r0, r1, r2
+ 
+ 	ALU:
+-		// a = rgbx ? 1.0 : src.a
+-		ALU0:	CSEL lp.lh, -u2.l, #1, r3.h
+-
+-		// swap bytes 0 and 2 if needed
+-		ALU1:	CSEL lp.lh, -u2.h, r3.l, r2.l
+-		ALU2:	CSEL lp.lh, -u2.h, r2.l, r3.l
+-
+-	ALU:
+-		ALU0:	MAD  r0.l, alu1, u0.l, #0
+-		ALU1:	MAD  r0.h, r2.h, u0.h, #0
+-		ALU2:	MAD  r1.l, alu2, u1.l, #0
+-		ALU3:	MAD  r1.h, alu0, u1.h, #0
++		ALU0:	MAD  r0.l, r0.l, u0.l, #0
++		ALU1:	MAD  r0.h, r0.h, u0.h, #0
++		ALU2:	MAD  r1.l, r1.l, u1.l, #0
++		ALU3:	MAD  r1.h, r1.h, u1.h, #0
+ 
+ 	DW:	store rt1, r0, r1
+ ;
+diff --git a/src/gallium/drivers/grate/fp/wlr/tex_over.asm b/src/gallium/drivers/grate/fp/wlr/tex_over.asm
+index 15c7e2c..fc003e2 100644
+--- a/src/gallium/drivers/grate/fp/wlr/tex_over.asm
++++ b/src/gallium/drivers/grate/fp/wlr/tex_over.asm
+@@ -1,49 +1,34 @@
+ // src = texture2D(tex0, v_texcoord) * alpha
+-// dst = src + dst * (1 - src.a)   (premultiplied over)
+-pseq_to_dw_exec_nb = 2
++// dst = src + dst * (1 - src.a)   (premultiplied over), one pass
++pseq_to_dw_exec_nb = 1
+ alu_buffer_size = 1
+ 
+ .asm
+ 
+ EXEC
++	// fetch dst pixel to r2,r3; the texel goes to r0,r1
++	PSEQ:	0x0081000A
++
+ 	MFU:	sfu:  rcp r4
+ 		mul0: bar, sfu, bar0
+ 		mul1: bar, sfu, bar1
+ 		ipl:  t0.fp20, t0.fp20, NOP, NOP
+ 
+-	TEX:	tex r2, r3, tex0, r0, r1, r2
+-
+-	ALU:
+-		// a = rgbx ? 1.0 : src.a
+-		ALU0:	CSEL lp.lh, -u2.l, #1, r3.h
+-
+-		// swap bytes 0 and 2 if needed
+-		ALU1:	CSEL lp.lh, -u2.h, r3.l, r2.l
+-		ALU2:	CSEL lp.lh, -u2.h, r2.l, r3.l
+-
+-	ALU:
+-		ALU0:	MAD  r0.l, alu1, u0.l, #0
+-		ALU1:	MAD  r0.h, r2.h, u0.h, #0
+-		ALU2:	MAD  r1.l, alu2, u1.l, #0
+-		ALU3:	MAD  r1.h, alu0, u1.h, #0
+-;
+-
+-EXEC
+-	// fetch dst pixel to r2,r3
+-	PSEQ:	0x0081000A
++	TEX:	tex r0, r1, tex0, r0, r1, r2
+ 
+-	// tmp = -src.a * dst + dst
++	// k = 1 - src.a * alpha, src * alpha
+ 	ALU:
+-		ALU0:	MAD  lp.lh, -r1.h, r2.l, r2.l
+-		ALU1:	MAD  lp.lh, -r1.h, r2.h, r2.h
+-		ALU2:	MAD  lp.lh, -r1.h, r3.l, r3.l
+-		ALU3:	MAD  lp.lh, -r1.h, r3.h, r3.h
++		ALU0:	MAD  lp.lh, -r1.h, u1.h, #1
++		ALU1:	MAD  lp.lh, r0.l, u0.l, #0
++		ALU2:	MAD  lp.lh, r0.h, u0.h, #0
++		ALU3:	MAD  lp.lh, r1.l, u1.l, #0
+ 
++	// dst * k + src * alpha; alpha: k * (dst.a - 1) + 1
+ 	ALU:
+-		ALU0:	MAD  r0.l, r0.l, #1, alu0 (sat)
+-		ALU1:	MAD  r0.h, r0.h, #1, alu1 (sat)
+-		ALU2:	MAD  r1.l, r1.l, #1, alu2 (sat)
+-		ALU3:	MAD  r1.h, r1.h, #1, alu3 (sat)
++		ALU0:	MAD  r0.l, r2.l, alu0, alu1 (sat)
++		ALU1:	MAD  r0.h, r2.h, alu0, alu2 (sat)
++		ALU2:	MAD  r1.l, r3.l, alu0, alu3 (sat)
++		ALU3:	MAD  r1.h, alu0, r3.h-1, #1 (sat)
+ 
+ 	DW:	store rt1, r0, r1
+ ;
+diff --git a/src/gallium/drivers/grate/fp/wlr/tex_rgbx.asm b/src/gallium/drivers/grate/fp/wlr/tex_rgbx.asm
+new file mode 100644
+index 0000000..876f2c0
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/tex_rgbx.asm
+@@ -0,0 +1,22 @@
++// gl_FragColor = vec4(texture2D(tex0, v_texcoord).rgb, 1) * alpha
++pseq_to_dw_exec_nb = 1
++alu_buffer_size = 1
++
++.asm
++
++EXEC
++	MFU:	sfu:  rcp r4
++		mul0: bar, sfu, bar0
++		mul1: bar, sfu, bar1
++		ipl:  t0.fp20, t0.fp20, NOP, NOP
++
++	TEX:	tex r0, r1, tex0, r0, r1, r2
++
++	ALU:
++		ALU0:	MAD  r0.l, r0.l, u0.l, #0
++		ALU1:	MAD  r0.h, r0.h, u0.h, #0
++		ALU2:	MAD  r1.l, r1.l, u1.l, #0
++		ALU3:	MAD  r1.h, u1.h, #1, #0
++
++	DW:	store rt1, r0, r1
++;
+diff --git a/src/gallium/drivers/grate/fp/wlr/tex_rgbx_over.asm b/src/gallium/drivers/grate/fp/wlr/tex_rgbx_over.asm
+new file mode 100644
+index 0000000..65202e3
+--- /dev/null
++++ b/src/gallium/drivers/grate/fp/wlr/tex_rgbx_over.asm
+@@ -0,0 +1,31 @@
++// src = vec4(texture2D(tex0, v_texcoord).rgb, 1) * alpha
++// dst = src + dst * (1 - alpha), one pass; u2.l = 1 - alpha
++pseq_to_dw_exec_nb = 1
++alu_buffer_size = 1
++
++.asm
++
++EXEC
++	// fetch dst pixel to r2,r3; the texel goes to r0,r1
++	PSEQ:	0x0081000A
++
++	MFU:	sfu:  rcp r4
++		mul0: bar, sfu, bar0
++		mul1: bar, sfu, bar1
++		ipl:  t0.fp20, t0.fp20, NOP, NOP
++
++	TEX:	tex r0, r1, tex0, r0, r1, r2
++
++	ALU:
++		ALU0:	MAD  lp.lh, r0.l, u0.l, #0
++		ALU1:	MAD  lp.lh, r0.h, u0.h, #0
++		ALU2:	MAD  lp.lh, r1.l, u1.l, #0
++
++	ALU:
++		ALU0:	MAD  r0.l, r2.l, u2.l, alu0 (sat)
++		ALU1:	MAD  r0.h, r2.h, u2.l, alu1 (sat)
++		ALU2:	MAD  r1.l, r3.l, u2.l, alu2 (sat)
++		ALU3:	MAD  r1.h, r3.h, u2.l, u1.h (sat)
++
++	DW:	store rt1, r0, r1
++;
+diff --git a/src/gallium/drivers/grate/fp/wlr/wlr_programs.h b/src/gallium/drivers/grate/fp/wlr/wlr_programs.h
+index 4cf9638..9f67c32 100644
+--- a/src/gallium/drivers/grate/fp/wlr/wlr_programs.h
++++ b/src/gallium/drivers/grate/fp/wlr/wlr_programs.h
+@@ -67,44 +67,30 @@ static const struct shader_program prog_wlr_solid = {
+ #ifndef fp_wlr_solid_over_def
+ #define fp_wlr_solid_over_def
+ static const uint32_t fs_wlr_solid_over_words[] = {
+-    HOST1X_OPCODE_NONINCR(0x541, 2),
+-    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x541, 1),
+     0x0081000A,
+     HOST1X_OPCODE_IMM(0x500, 0x0),
+-    HOST1X_OPCODE_NONINCR(0x601, 2),
++    HOST1X_OPCODE_NONINCR(0x601, 1),
+     0x00000001,
+-    0x00000000,
+     HOST1X_OPCODE_NONINCR(0x604, 2),
+     0x104E51BA,
+     0x00000102,
+-    HOST1X_OPCODE_NONINCR(0x701, 2),
+-    0x00000000,
+-    0x00000000,
+-    HOST1X_OPCODE_NONINCR(0x801, 2),
+-    0x00000000,
+-    0x00000002,
+-    HOST1X_OPCODE_NONINCR(0x804, 16),
+-    0x000FE86A,
+-    0x04402200,
+-    0x000FE86A,
+-    0x05402A00,
+-    0x000FE86A,
+-    0x06403200,
+-    0x000FE86A,
+-    0x07403A00,
+-    0x01002808,
+-    0x3F418000,
+-    0x01004828,
+-    0x3F419000,
+-    0x0100A848,
+-    0x3F41A000,
+-    0x0100C868,
+-    0x3F41B000,
+-    HOST1X_OPCODE_NONINCR(0x806, 2),
+-    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x701, 1),
+     0x00000000,
+-    HOST1X_OPCODE_NONINCR(0x901, 2),
++    HOST1X_OPCODE_NONINCR(0x801, 1),
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x804, 8),
++    0x01002088,
++    0x44420200,
++    0x010040A8,
++    0x44420A00,
++    0x0100A0C8,
++    0x44421200,
++    0x0100C0E8,
++    0x44421A00,
++    HOST1X_OPCODE_NONINCR(0x806, 1),
+     0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 1),
+     0x00020005,
+ };
+ #endif
+@@ -127,8 +113,8 @@ static const struct shader_program prog_wlr_solid_over = {
+     .fs_prog_words = fs_wlr_solid_over_words,
+     .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_solid_over_words),
+     .fs_alu_buf_size = 1,
+-    .fs_pseq_to_dw = 2,
+-    .fs_pseq_inst_nb = 2,
++    .fs_pseq_to_dw = 1,
++    .fs_pseq_inst_nb = 1,
+ 
+     .linker_words = lnk_wlr_link_solid_words,
+     .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_solid_words),
+@@ -152,25 +138,17 @@ static const uint32_t fs_wlr_tex_words[] = {
+     0x104E51BA,
+     0x00000102,
+     HOST1X_OPCODE_NONINCR(0x701, 1),
+-    0x00000420,
++    0x00000400,
+     HOST1X_OPCODE_NONINCR(0x801, 1),
+-    0x00000002,
+-    HOST1X_OPCODE_NONINCR(0x804, 16),
+-    0xC00FE88A,
+-    0x3F403A00,
+-    0xC00FE8AA,
+-    0x06402200,
+-    0xC00FE8AA,
+-    0x04403200,
+-    0x000FE7E8,
+-    0x3E41F200,
+-    0x00002640,
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x804, 8),
++    0x00002008,
+     0x4041F200,
+-    0x000040A8,
++    0x00004028,
+     0x4141F200,
+-    0x0000A680,
++    0x0000A048,
+     0x4241F200,
+-    0x0000C600,
++    0x0000C068,
+     0x4341F200,
+     HOST1X_OPCODE_NONINCR(0x806, 1),
+     0x00000000,
+@@ -213,60 +191,38 @@ static const struct shader_program prog_wlr_tex = {
+ #ifndef fp_wlr_tex_over_def
+ #define fp_wlr_tex_over_def
+ static const uint32_t fs_wlr_tex_over_words[] = {
+-    HOST1X_OPCODE_NONINCR(0x541, 2),
+-    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x541, 1),
+     0x0081000A,
+     HOST1X_OPCODE_IMM(0x500, 0x0),
+-    HOST1X_OPCODE_NONINCR(0x601, 2),
++    HOST1X_OPCODE_NONINCR(0x601, 1),
+     0x00000001,
+-    0x00000000,
+     HOST1X_OPCODE_NONINCR(0x604, 2),
+     0x104E51BA,
+     0x00000102,
+-    HOST1X_OPCODE_NONINCR(0x701, 2),
+-    0x00000420,
+-    0x00000000,
+-    HOST1X_OPCODE_NONINCR(0x801, 2),
++    HOST1X_OPCODE_NONINCR(0x701, 1),
++    0x00000400,
++    HOST1X_OPCODE_NONINCR(0x801, 1),
+     0x00000002,
+-    0x0000000A,
+-    HOST1X_OPCODE_NONINCR(0x804, 32),
+-    0xC00FE88A,
+-    0x3F403A00,
+-    0xC00FE8AA,
+-    0x06402200,
+-    0xC00FE8AA,
+-    0x04403200,
+-    0x000FE7E8,
+-    0x3E41F200,
+-    0x00002640,
++    HOST1X_OPCODE_NONINCR(0x804, 16),
++    0x000FE06A,
++    0x4341FA00,
++    0x000FE008,
+     0x4041F200,
+-    0x000040A8,
++    0x000FE028,
+     0x4141F200,
+-    0x0000A680,
++    0x000FE048,
+     0x4241F200,
+-    0x0000C600,
+-    0x4341F200,
+-    0x000FE06A,
+-    0x04402200,
+-    0x000FE06A,
+-    0x05402A00,
+-    0x000FE06A,
+-    0x06403200,
+-    0x000FE06A,
+-    0x07403A00,
+-    0x01002008,
+-    0x3F418000,
+-    0x01004028,
+-    0x3F419000,
+-    0x0100A048,
+-    0x3F41A000,
+-    0x0100C068,
+-    0x3F41B000,
+-    HOST1X_OPCODE_NONINCR(0x806, 2),
+-    0x00000000,
+-    0x00000000,
+-    HOST1X_OPCODE_NONINCR(0x901, 2),
++    0x01002088,
++    0x30019000,
++    0x010040A8,
++    0x3001A000,
++    0x0100A0C8,
++    0x3001B000,
++    0x0100C600,
++    0x07C1FA00,
++    HOST1X_OPCODE_NONINCR(0x806, 1),
+     0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 1),
+     0x00020005,
+ };
+ #endif
+@@ -289,8 +245,8 @@ static const struct shader_program prog_wlr_tex_over = {
+     .fs_prog_words = fs_wlr_tex_over_words,
+     .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_tex_over_words),
+     .fs_alu_buf_size = 1,
+-    .fs_pseq_to_dw = 2,
+-    .fs_pseq_inst_nb = 2,
++    .fs_pseq_to_dw = 1,
++    .fs_pseq_inst_nb = 1,
+ 
+     .linker_words = lnk_wlr_link_tex_words,
+     .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_tex_words),
+@@ -300,3 +256,135 @@ static const struct shader_program prog_wlr_tex_over = {
+     .name = "wlr_tex_over",
+ };
+ #endif
++
++
++#ifndef fp_wlr_tex_rgbx_def
++#define fp_wlr_tex_rgbx_def
++static const uint32_t fs_wlr_tex_rgbx_words[] = {
++    HOST1X_OPCODE_NONINCR(0x541, 1),
++    0x00000000,
++    HOST1X_OPCODE_IMM(0x500, 0x0),
++    HOST1X_OPCODE_NONINCR(0x601, 1),
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x604, 2),
++    0x104E51BA,
++    0x00000102,
++    HOST1X_OPCODE_NONINCR(0x701, 1),
++    0x00000400,
++    HOST1X_OPCODE_NONINCR(0x801, 1),
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x804, 8),
++    0x00002008,
++    0x4041F200,
++    0x00004028,
++    0x4141F200,
++    0x0000A048,
++    0x4241F200,
++    0x0000C868,
++    0x3F41F200,
++    HOST1X_OPCODE_NONINCR(0x806, 1),
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 1),
++    0x00020005,
++};
++#endif
++
++
++
++#ifndef lp_wlr_link_tex_def
++#define lp_wlr_link_tex_def
++static const uint32_t lnk_wlr_link_tex_words[] = {
++    HOST1X_OPCODE_INCR(0x300, 2),
++    0x00000008,
++    0x0000FEDC,
++};
++#endif
++
++#ifndef prog_wlr_tex_rgbx_def
++#define prog_wlr_tex_rgbx_def
++static const struct shader_program prog_wlr_tex_rgbx = {
++
++    .fs_prog_words = fs_wlr_tex_rgbx_words,
++    .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_tex_rgbx_words),
++    .fs_alu_buf_size = 1,
++    .fs_pseq_to_dw = 1,
++    .fs_pseq_inst_nb = 1,
++
++    .linker_words = lnk_wlr_link_tex_words,
++    .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_tex_words),
++    .linker_inst_nb = 1,
++    .used_tram_rows_nb = 1,
++
++    .name = "wlr_tex_rgbx",
++};
++#endif
++
++
++#ifndef fp_wlr_tex_rgbx_over_def
++#define fp_wlr_tex_rgbx_over_def
++static const uint32_t fs_wlr_tex_rgbx_over_words[] = {
++    HOST1X_OPCODE_NONINCR(0x541, 1),
++    0x0081000A,
++    HOST1X_OPCODE_IMM(0x500, 0x0),
++    HOST1X_OPCODE_NONINCR(0x601, 1),
++    0x00000001,
++    HOST1X_OPCODE_NONINCR(0x604, 2),
++    0x104E51BA,
++    0x00000102,
++    HOST1X_OPCODE_NONINCR(0x701, 1),
++    0x00000400,
++    HOST1X_OPCODE_NONINCR(0x801, 1),
++    0x00000002,
++    HOST1X_OPCODE_NONINCR(0x804, 16),
++    0x000FE008,
++    0x4041F200,
++    0x000FE028,
++    0x4141F200,
++    0x000FE048,
++    0x4241F200,
++    0x000FE7E8,
++    0x3E41F200,
++    0x01002088,
++    0x44418000,
++    0x010040A8,
++    0x44419000,
++    0x0100A0C8,
++    0x4441A000,
++    0x0100C0E8,
++    0x44421A00,
++    HOST1X_OPCODE_NONINCR(0x806, 1),
++    0x00000000,
++    HOST1X_OPCODE_NONINCR(0x901, 1),
++    0x00020005,
++};
++#endif
++
++
++
++#ifndef lp_wlr_link_tex_def
++#define lp_wlr_link_tex_def
++static const uint32_t lnk_wlr_link_tex_words[] = {
++    HOST1X_OPCODE_INCR(0x300, 2),
++    0x00000008,
++    0x0000FEDC,
++};
++#endif
++
++#ifndef prog_wlr_tex_rgbx_over_def
++#define prog_wlr_tex_rgbx_over_def
++static const struct shader_program prog_wlr_tex_rgbx_over = {
++
++    .fs_prog_words = fs_wlr_tex_rgbx_over_words,
++    .fs_prog_words_nb = TEGRA_ARRAY_SIZE(fs_wlr_tex_rgbx_over_words),
++    .fs_alu_buf_size = 1,
++    .fs_pseq_to_dw = 1,
++    .fs_pseq_inst_nb = 1,
++
++    .linker_words = lnk_wlr_link_tex_words,
++    .linker_words_nb = TEGRA_ARRAY_SIZE(lnk_wlr_link_tex_words),
++    .linker_inst_nb = 1,
++    .used_tram_rows_nb = 1,
++
++    .name = "wlr_tex_rgbx_over",
++};
++#endif
+diff --git a/src/gallium/drivers/grate/grate_wlr.c b/src/gallium/drivers/grate/grate_wlr.c
+index 8ccc478..4a59b0d 100644
+--- a/src/gallium/drivers/grate/grate_wlr.c
++++ b/src/gallium/drivers/grate/grate_wlr.c
+@@ -218,16 +218,17 @@ emit_uniforms(struct grate_context *context, enum grate_wlr_fp kind)
+    if (!c || cb->buffer_size < 4 * sizeof(float))
+       c = zero;
+ 
++   /* see fp/wlr/README */
+    grate_stream_push(stream, host1x_opcode_incr(TGR3D_FP_CONST(0), 3));
+    if (kind == GRATE_WLR_FP_SOLID) {
+       /* render targets are B8G8R8A8/X8: bytes b, g, r, a */
+       grate_stream_push(stream, fx10x2(c[2], c[1]));
+       grate_stream_push(stream, fx10x2(c[0], c[3]));
+-      grate_stream_push(stream, 0);
++      grate_stream_push(stream, fx10x2(1.0f - c[3], 0));
+    } else {
+       grate_stream_push(stream, fx10x2(c[0], c[0]));
+       grate_stream_push(stream, fx10x2(c[0], c[0]));
+-      grate_stream_push(stream, fx10x2(kind == GRATE_WLR_FP_TEX_RGBX, 0));
++      grate_stream_push(stream, fx10x2(1.0f - c[0], 0));
+    }
+ }
+ 
+@@ -243,6 +244,8 @@ grate_wlr_emit_program(struct grate_context *context)
+ 
+    if (kind == GRATE_WLR_FP_SOLID)
+       prog = over ? &prog_wlr_solid_over : &prog_wlr_solid;
++   else if (kind == GRATE_WLR_FP_TEX_RGBX)
++      prog = over ? &prog_wlr_tex_rgbx_over : &prog_wlr_tex_rgbx;
+    else
+       prog = over ? &prog_wlr_tex_over : &prog_wlr_tex;
+ 

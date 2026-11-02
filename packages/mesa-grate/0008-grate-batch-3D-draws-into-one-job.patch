@@ -1,0 +1,301 @@
+From cb9396c3823dd13f41d42d3bd3792d753123e379 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:30:00 -0300
+Subject: [PATCH 8/9] grate: batch 3D draws into one job
+
+Each draw was its own job: submit, host1x firewall copy, then a CPU
+wait for the GPU. Keep appending draws to the open job (state reset once
+per job, per-draw state as before) and submit it from grate_flush_3d():
+
+- pipe_context::flush (was a stub) and context destroy,
+- transfer_map without PIPE_MAP_UNSYNCHRONIZED (CPU reads/writes),
+- 2D blits and fills, to keep the engines in order,
+- when the job gets close to the stream's initial buffer size, so it
+  stays a single gather.
+
+The stream keeps a reference on every BO a relocation points at until
+the job is submitted, since owners may free a resource (e.g. an uploaded
+index buffer, now released after the draw instead of leaked) before then.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/grate_context.c  |  7 ++-
+ src/gallium/drivers/grate/grate_draw.c     | 52 +++++++++++++++++-----
+ src/gallium/drivers/grate/grate_draw.h     |  8 ++++
+ src/gallium/drivers/grate/grate_resource.c | 11 +++++
+ src/gallium/drivers/grate/grate_stream.c   | 39 +++++++++++++++-
+ src/gallium/drivers/grate/grate_stream.h   |  9 +++-
+ 6 files changed, 112 insertions(+), 14 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_context.c b/src/gallium/drivers/grate/grate_context.c
+index 145161c..5b01a79 100644
+--- a/src/gallium/drivers/grate/grate_context.c
++++ b/src/gallium/drivers/grate/grate_context.c
+@@ -64,6 +64,8 @@ grate_context_destroy(struct pipe_context *pcontext)
+ {
+    struct grate_context *context = grate_context(pcontext);
+ 
++   grate_flush_3d(context);
++
+    if (context->primconvert)
+       util_primconvert_destroy(context->primconvert);
+ 
+@@ -82,7 +84,10 @@ grate_context_flush(struct pipe_context *pcontext,
+                     struct pipe_fence_handle **pfence,
+                     enum pipe_flush_flags flags)
+ {
+-   unimplemented();
++   /* submits and waits, so there is no fence to hand out */
++   grate_flush_3d(grate_context(pcontext));
++   if (pfence)
++      *pfence = NULL;
+ }
+ 
+ struct pipe_context *
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index f46de31..85be804 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -5,6 +5,7 @@
+ #include "util/u_bitcast.h"
+ #include "util/u_draw.h"
+ #include "util/u_helpers.h"
++#include "util/u_inlines.h"
+ #include "util/u_prim.h"
+ #include "indices/u_primconvert.h"
+ 
+@@ -389,18 +390,33 @@ grate_draw_vbo(struct pipe_context *pcontext,
+       return;
+    }
+ 
+-   err = grate_stream_begin(stream);
+-   if (err < 0) {
+-      fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
+-      return;
+-   }
+-
+    /*
+-    * The state needs to be re-initialized on each draw since tegra doesn't
+-    * support context switching in a good way, hardware is optimized for
+-    * uploading.
++    * Draws are batched into one job until grate_flush_3d(): the context is
++    * flushed, the CPU maps a resource, the 2D engine is used or the job gets
++    * big. The command buffer starts with room for the stream's num_words;
++    * stay within it so the job keeps a single gather.
+     */
+-   grate_init_state(context);
++   if (stream->status != GRATE_STREAM_FREE &&
++       (stream->status != GRATE_STREAM_CONSTRUCT ||
++        stream->buffer.pushbuf->ptr - stream->dump_start >
++        stream->num_words - GRATE_3D_DRAW_WORDS_MAX))
++      grate_flush_3d(context);
++
++   if (stream->status == GRATE_STREAM_FREE) {
++      err = grate_stream_begin(stream);
++      if (err < 0) {
++         fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
++         return;
++      }
++
++      /*
++       * tegra doesn't support context switching in a good way, so each job
++       * starts from a reset state.
++       */
++      grate_init_state(context);
++   }
++
++   /* everything a draw depends on is emitted again for each draw */
+    grate_emit_state(context);
+ 
+    grate_stream_push(stream, host1x_opcode_incr(TGR3D_VP_ATTRIB_IN_OUT_SELECT, 1));
+@@ -478,7 +494,21 @@ grate_draw_vbo(struct pipe_context *pcontext,
+    grate_stream_push(stream, host1x_opcode_incr(TGR3D_DRAW_PRIMITIVES, 1));
+    grate_stream_push(stream, value);
+ 
+-   grate_stream_end(stream);
++   if (index_buffer && info->has_user_indices)
++      pipe_resource_reference(&index_buffer, NULL); /* the job holds its BO */
++}
++
++/* submit the batched draws and wait for them */
++void
++grate_flush_3d(struct grate_context *context)
++{
++   struct grate_stream *stream = &context->gr3d->stream;
++
++   if (stream->status == GRATE_STREAM_FREE)
++      return;
++
++   if (stream->status == GRATE_STREAM_CONSTRUCT)
++      grate_stream_end(stream);
+ 
+    grate_stream_flush(stream);
+ }
+diff --git a/src/gallium/drivers/grate/grate_draw.h b/src/gallium/drivers/grate/grate_draw.h
+index f83f4cb..f917406 100644
+--- a/src/gallium/drivers/grate/grate_draw.h
++++ b/src/gallium/drivers/grate/grate_draw.h
+@@ -1,7 +1,15 @@
+ #ifndef GRATE_DRAW_H
+ #define GRATE_DRAW_H
+ 
++struct grate_context;
++
++/* upper bound of the words one draw adds to the 3D job */
++#define GRATE_3D_DRAW_WORDS_MAX 2048
++
+ void
+ grate_context_draw_init(struct pipe_context *pcontext);
+ 
++void
++grate_flush_3d(struct grate_context *context);
++
+ #endif
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index 17fc58d..968bf9e 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -11,6 +11,7 @@
+ 
+ #include "grate_common.h"
+ #include "grate_context.h"
++#include "grate_draw.h"
+ #include "grate_resource.h"
+ #include "grate_screen.h"
+ 
+@@ -98,6 +99,10 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
+    if (usage & PIPE_MAP_DIRECTLY)
+       return NULL;
+ 
++   /* batched draws may read or write the resource */
++   if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
++      grate_flush_3d(context);
++
+    ptrans = slab_alloc(&context->transfer_pool);
+    if (!ptrans)
+       return NULL;
+@@ -326,6 +331,9 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+    dst = grate_resource(info->dst.resource);
+    src = grate_resource(info->src.resource);
+ 
++   /* keep the 2D engine in order with batched 3D draws */
++   grate_flush_3d(context);
++
+    err = grate_stream_begin(&gr2d->stream);
+    if (err < 0) {
+       fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
+@@ -413,6 +421,9 @@ fill(struct grate_channel *gr2d,
+    uint32_t value;
+    int err;
+ 
++   /* keep the 2D engine in order with batched 3D draws */
++   grate_flush_3d(gr2d->context);
++
+    err = grate_stream_begin(&gr2d->stream);
+    if (err < 0) {
+       fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
+diff --git a/src/gallium/drivers/grate/grate_stream.c b/src/gallium/drivers/grate/grate_stream.c
+index a3e6bb5..e6d1720 100644
+--- a/src/gallium/drivers/grate/grate_stream.c
++++ b/src/gallium/drivers/grate/grate_stream.c
+@@ -56,6 +56,14 @@
+  * grate_stream_push().
+  */
+ 
++static void
++release_bos(struct grate_stream *stream)
++{
++   for (unsigned i = 0; i < stream->num_bos; i++)
++      drm_tegra_bo_unref(stream->bos[i]);
++   stream->num_bos = 0;
++}
++
+ int
+ grate_stream_create(struct drm_tegra *drm,
+                     struct drm_tegra_channel *channel,
+@@ -82,6 +90,31 @@ grate_stream_destroy(struct grate_stream *stream)
+       return;
+ 
+    drm_tegra_job_free(stream->job);
++   release_bos(stream);
++   free(stream->bos);
++}
++
++/*
++ * Draws are batched into one job, so a BO a queued draw uses may be freed
++ * by its owner before the job is submitted: keep a reference until then.
++ */
++int
++grate_stream_hold_bo(struct grate_stream *stream, struct drm_tegra_bo *bo)
++{
++   if (stream->num_bos == stream->max_bos) {
++      unsigned max = stream->max_bos ? stream->max_bos * 2 : 64;
++      struct drm_tegra_bo **bos = realloc(stream->bos, max * sizeof(*bos));
++
++      if (!bos) {
++         stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
++         return -1;
++      }
++      stream->bos = bos;
++      stream->max_bos = max;
++   }
++
++   stream->bos[stream->num_bos++] = drm_tegra_bo_ref(bo);
++   return 0;
+ }
+ 
+ /*
+@@ -139,6 +172,7 @@ grate_stream_flush(struct grate_stream *stream)
+ 
+ cleanup:
+    drm_tegra_job_free(stream->job);
++   release_bos(stream);
+ 
+    stream->job = NULL;
+    stream->status = GRATE_STREAM_FREE;
+@@ -229,7 +263,7 @@ grate_stream_push_reloc(struct grate_stream *stream,
+       return -1;
+    }
+ 
+-   return 0;
++   return grate_stream_hold_bo(stream, bo);
+ }
+ 
+ /*
+@@ -404,6 +438,9 @@ int grate_stream_push_words(struct grate_stream *stream, const void *addr,
+          ErrorMsg("drm_tegra_pushbuf_relocate() failed %d\n", ret);
+          break;
+       }
++      ret = grate_stream_hold_bo(stream, reloc_arg.bo);
++      if (ret != 0)
++         break;
+    }
+    va_end(ap);
+ 
+diff --git a/src/gallium/drivers/grate/grate_stream.h b/src/gallium/drivers/grate/grate_stream.h
+index bb6fd38..803b6d5 100644
+--- a/src/gallium/drivers/grate/grate_stream.h
++++ b/src/gallium/drivers/grate/grate_stream.h
+@@ -53,7 +53,11 @@ struct grate_stream {
+    struct grate_command_buffer buffer;
+    int num_words;
+    uint32_t class_id;
+-   uint32_t *dump_start; /* GRATE_DUMP=1: print each job's words */
++   uint32_t *dump_start; /* first word of the job (GRATE_DUMP=1, job size) */
++
++   /* references on the BOs the job's relocations point at, until submit */
++   struct drm_tegra_bo **bos;
++   unsigned num_bos, max_bos;
+ };
+ 
+ struct grate_reloc {
+@@ -82,6 +86,9 @@ int
+ grate_stream_sync(struct grate_stream *stream,
+                   enum drm_tegra_syncpt_cond cond);
+ 
++int
++grate_stream_hold_bo(struct grate_stream *stream, struct drm_tegra_bo *bo);
++
+ int
+ grate_stream_flush(struct grate_stream *stream);
+ 

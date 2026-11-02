@@ -1,0 +1,51 @@
+From b2ab67e62569f0b7c87a5cc671f10b48c8ad12fd Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:30:00 -0300
+Subject: [PATCH 9/9] grate: GRATE_TIME=1 prints submit and wait time per job
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/grate_stream.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/gallium/drivers/grate/grate_stream.c b/src/gallium/drivers/grate/grate_stream.c
+index e6d1720..91fdc68 100644
+--- a/src/gallium/drivers/grate/grate_stream.c
++++ b/src/gallium/drivers/grate/grate_stream.c
+@@ -39,6 +39,7 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ 
++#include "util/os_time.h"
+ #include "host1x01_hardware.h"
+ #include "hw_host1x01_uclass.h"
+ #include "grate_stream.h"
+@@ -155,6 +156,8 @@ grate_stream_flush(struct grate_stream *stream)
+       fprintf(stderr, "\nGRATE_DUMP end\n");
+    }
+ 
++   int64_t t0 = os_time_get_nano();
++
+    result = drm_tegra_job_submit(stream->job, &fence);
+    if (result != 0) {
+       ErrorMsg("drm_tegra_job_submit() failed %d\n", result);
+@@ -162,12 +165,19 @@ grate_stream_flush(struct grate_stream *stream)
+       goto cleanup;
+    }
+ 
++   int64_t t1 = os_time_get_nano();
++
+    result = drm_tegra_fence_wait_timeout(fence, 1000);
+    if (result != 0) {
+       ErrorMsg("drm_tegra_fence_wait_timeout() failed %d\n", result);
+       result = -1;
+    }
+ 
++   if (getenv("GRATE_TIME"))
++      fprintf(stderr, "GRATE_TIME %u words: submit %.2f ms, wait %.2f ms\n",
++              (unsigned)(stream->buffer.pushbuf->ptr - stream->dump_start),
++              (t1 - t0) / 1e6, (os_time_get_nano() - t1) / 1e6);
++
+    drm_tegra_fence_free(fence);
+ 
+ cleanup:

@@ -1,0 +1,42 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# phoc-gpu - start phoc on the Tegra 2 GPU (grate Mesa in /opt/mesa-grate,
+# wlroots' GLES2 renderer). The session phoc starts (-E) gets the normal
+# environment back, so Phosh and apps keep drawing with cairo.
+# If phoc on the GPU fails within a few seconds, phoc runs again with the
+# software (pixman) renderer instead.
+# Used from ~/.phoshdebug:  COMPOSITOR=/usr/libexec/nuraxoom/phoc-gpu
+GRATE=/opt/mesa-grate
+PHOC=${PHOC:-/usr/bin/phoc}
+
+[ -e $GRATE/lib/dri/tegra_dri.so ] || exec $PHOC "$@"
+
+gpu_env="LD_LIBRARY_PATH=$GRATE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+gpu_env="$gpu_env LIBGL_DRIVERS_PATH=$GRATE/lib/dri WLR_RENDERER=gles2"
+
+# rewrite "-E cmd" so cmd runs without the grate environment
+restore="env -u LIBGL_DRIVERS_PATH"
+if [ -n "$LD_LIBRARY_PATH" ]; then
+	restore="$restore LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+else
+	restore="env -u LIBGL_DRIVERS_PATH -u LD_LIBRARY_PATH"
+fi
+restore="$restore WLR_RENDERER=${WLR_RENDERER:-pixman}"
+
+gpu_args=
+for a in "$@"; do
+	if [ "$prev" = -E ]; then
+		a="$restore $a"
+	fi
+	gpu_args="$gpu_args '$(printf %s "$a" | sed "s/'/'\\\\''/g")'"
+	prev=$a
+done
+
+start=$(date +%s)
+eval env $gpu_env $PHOC $gpu_args
+rc=$?
+if [ $rc -ne 0 ] && [ $(($(date +%s) - start)) -lt 15 ]; then
+	echo "phoc-gpu: phoc on the GPU failed ($rc), using the software renderer" >&2
+	exec $PHOC "$@"
+fi
+exit $rc

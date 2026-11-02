@@ -1,0 +1,29 @@
+From cc1833e694a7957526cd29aac67834df91834172 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:00:00 -0300
+Subject: [PATCH 1/5] build: check the mako version without distutils
+
+distutils is gone from Python 3.12 (Alpine edge), so the version check
+failed and configure reported mako as missing. Use packaging.version.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ meson.build | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index caf4566..f3054bf 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1011,9 +1011,9 @@ prog_python = import('python').find_installation('python3')
+ has_mako = run_command(
+   prog_python, '-c',
+   '''
+-from distutils.version import StrictVersion
++from packaging.version import Version
+ import mako
+-assert StrictVersion(mako.__version__) > StrictVersion("0.8.0")
++assert Version(mako.__version__) > Version("0.8.0")
+   ''', check: false)
+ if has_mako.returncode() != 0
+   error('Python (3.x) mako module >= 0.8.0 required to build mesa.')

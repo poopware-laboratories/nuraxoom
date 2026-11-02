@@ -1,0 +1,421 @@
+From 1f4eb38562e1e58a42f0f73cc70c35bf5299eec1 Mon Sep 17 00:00:00 2001
+From: s1oplus <victorgarcez@proton.me>
+Date: Mon, 2 Nov 2026 18:00:00 -0300
+Subject: [PATCH 3/5] grate: make 3D draws render on the upstream kernel
+
+On Tegra20 with the upstream (UAPI v1) kernel, grate's 3D jobs ran but
+left the render target untouched. Fixes, in order of impact:
+
+- Vertex shader immediates were read from constant slot 1023 - index but
+  never uploaded, so e.g. gl_Position.w = 1.0 read garbage. Place them
+  after the declared constants and upload them with the uniforms.
+- DRAW_PARAMS.FIRST got the draw start, which was also applied through
+  the index pointer / DRAW_PRIMITIVES offset. FIRST is the vertex base.
+- With the depth test off gallium leaves depth_func at NEVER, and the
+  hardware applies it anyway: use ALWAYS then.
+- Without a depth buffer, render target 0 had no BO and the relocation of
+  its NULL pointer failed the whole job; skip RT pointers without a BO.
+- Emit xf86-video-opentegra's known-good state reset after grate's own
+  (FDC invalidate, 0x740 = 0x35, guardband 1.0, stencil off, ...) and its
+  pre-draw cache maintenance plus RD_DONE sync (grate_stream_sync()).
+- Allocate render targets / textures without
+  DRM_TEGRA_GEM_CREATE_BOTTOM_UP, which the upstream display driver scans
+  out flipped, and align the pitch the way the texture sampler expects
+  (16 bytes for power-of-two sizes, 64 otherwise).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/grate/grate_compiler.h |  7 ++
+ src/gallium/drivers/grate/grate_draw.c     | 93 +++++++++++++++++++++-
+ src/gallium/drivers/grate/grate_program.c  |  3 +
+ src/gallium/drivers/grate/grate_program.h  |  5 ++
+ src/gallium/drivers/grate/grate_resource.c | 14 +++-
+ src/gallium/drivers/grate/grate_state.c    | 32 +++++++-
+ src/gallium/drivers/grate/grate_stream.c   | 22 +++++
+ src/gallium/drivers/grate/grate_stream.h   |  4 +
+ src/gallium/drivers/grate/vp/tgsi.c        | 26 +++++-
+ 9 files changed, 194 insertions(+), 12 deletions(-)
+
+diff --git a/src/gallium/drivers/grate/grate_compiler.h b/src/gallium/drivers/grate/grate_compiler.h
+index 846b539..0e13a83 100644
+--- a/src/gallium/drivers/grate/grate_compiler.h
++++ b/src/gallium/drivers/grate/grate_compiler.h
+@@ -7,9 +7,16 @@
+ 
+ struct tgsi_parse_context;
+ 
++#define GRATE_VP_MAX_IMMEDIATES 32
++
+ struct grate_vp_shader {
+    struct list_head instructions;
+    uint16_t output_mask;
++
++   /* immediates live in the constant slots after the declared constants */
++   unsigned num_consts;
++   unsigned num_immediates;
++   float immediates[GRATE_VP_MAX_IMMEDIATES][4];
+ };
+ 
+ struct grate_fp_info {
+diff --git a/src/gallium/drivers/grate/grate_draw.c b/src/gallium/drivers/grate/grate_draw.c
+index f94db1f..b3dc5d6 100644
+--- a/src/gallium/drivers/grate/grate_draw.c
++++ b/src/gallium/drivers/grate/grate_draw.c
+@@ -48,6 +48,73 @@ grate_primitive_type(enum pipe_prim_type mode)
+    }
+ }
+ 
++#define OP_IMM(offset, data)    ((4u << 28) | ((offset) << 16) | (data))
++#define OP_INCR(offset, count)  ((1u << 28) | ((offset) << 16) | (count))
++
++/*
++ * xf86-video-opentegra's 3D state reset and tgr3d_initialize() values,
++ * which are known to render on the upstream kernel. Emitted after grate's
++ * own reset, so they win where the two differ.
++ */
++static const uint32_t opentegra_state_reset[] = {
++   OP_INCR(0x907, 5), 0, 0, 0, 0, 0,
++   OP_INCR(0xb00, 2), 0x00000003, 0x00000000,
++   OP_IMM(0x7e0, 0x0001),
++   OP_IMM(0x7e1, 0x0000),
++   OP_IMM(0xb04, 0x0000),
++   OP_IMM(0xb14, 0x0000),
++   OP_INCR(0x00d, 9), 0, 0, 0, 0, 0, 0, 0, 0, 0,
++   OP_IMM(0x124, 0x0007),
++   OP_IMM(0x125, 0x0000),
++   OP_IMM(0x126, 0x0000),
++   OP_INCR(0x200, 5), 0x00000011, 0x0000ffff, 0x00ff0000, 0, 0,
++   OP_IMM(0x209, 0x0000),
++   OP_IMM(0x20a, 0x0000),
++   OP_IMM(0x20b, 0x0003),
++   OP_IMM(0x34e, 0x0000), /* 0x3f800000 doesn't fit IMM, set below */
++   OP_IMM(0x34f, 0x0000),
++   OP_IMM(0x35b, 0x0205),
++   OP_IMM(0x363, 0x0000),
++   OP_IMM(0x364, 0x0000),
++   OP_IMM(0x412, 0x0000),
++   OP_IMM(0x413, 0x0000),
++   OP_IMM(0xe40, 0x0000),
++   OP_IMM(0xe41, 0x0000),
++   OP_IMM(0xe25, 0x0000),
++   OP_IMM(0xe26, 0x0000),
++   OP_INCR(0x406, 12),
++      0x00000001, 0x00000000, 0x00000000, 0x00000000,
++      0x1fff1fff, 0x00000000, 0x00000006, 0x00000000,
++      0x00000008, 0x00000048, 0x00000000, 0x00000000,
++   OP_IMM(0x501, 0x0007),
++   OP_IMM(0x502, 0x0000),
++   OP_IMM(0x503, 0x0000),
++   OP_IMM(0x542, 0x0000),
++   OP_IMM(0x543, 0x0000),
++   OP_IMM(0x544, 0x0000),
++   OP_IMM(0x545, 0x0000),
++   OP_IMM(0x60e, 0x0000),
++   OP_IMM(0x702, 0x0000),
++   OP_IMM(0x740, 0x0035),
++   OP_IMM(0x741, 0x0000),
++   OP_IMM(0x742, 0x0000),
++   OP_IMM(0x902, 0x0000),
++   OP_INCR(TGR3D_FDC_CONTROL, 13),
++      0x00000e00 | TGR3D_FDC_CONTROL_INVALIDATE,
++      0x00000000, 0x000001ff, 0x000001ff, 0x000001ff,
++      0x00000030, 0x00000020, 0x000001ff, 0x00000100,
++      0x0f0f0f0f, 0x00000000, 0x00000000, 0x00000000,
++   /* tgr3d_initialize() */
++   OP_INCR(0x34e, 1), 0x3f800000,
++   OP_INCR(TGR3D_GUARDBAND_WIDTH, 3), 0x3f800000, 0x3f800000, 0x3f800000,
++   OP_IMM(0x40f, 0x0048),
++   OP_INCR(TGR3D_DEPTH_RANGE_NEAR, 2), 0x00000000, 0x000fffff,
++   OP_INCR(TGR3D_DEPTH_TEST_PARAMS, 1), (TGR3D_COMPARE_FUNC_ALWAYS << 4) | 0x200,
++   OP_INCR(TGR3D_STENCIL_FRONT1, 3), 0x00000000, 0x00000000, 0x00000008,
++   OP_INCR(TGR3D_STENCIL_FRONT2, 2), 0x0001fe00, 0x0001fe00,
++   OP_INCR(TGR3D_POLYGON_OFFSET_UNITS, 2), 0x00000000, 0x00000000,
++};
++
+ static int
+ grate_init_state(struct grate_context *context)
+ {
+@@ -242,14 +309,15 @@ grate_init_state(struct grate_context *context)
+    grate_stream_push(stream, host1x_opcode_imm(0x546, 0));
+    grate_stream_push(stream, host1x_opcode_imm(0x60e, 0));
+    grate_stream_push(stream, host1x_opcode_imm(0x702, 0));
+-   grate_stream_push(stream, host1x_opcode_imm(0x740, 0x1));
++   /* 0x035 as in opentegra and grate's own tests (was 0x1) */
++   grate_stream_push(stream, host1x_opcode_imm(0x740, 0x035));
+    grate_stream_push(stream, host1x_opcode_imm(0x741, 0));
+    grate_stream_push(stream, host1x_opcode_imm(0x742, 0));
+    grate_stream_push(stream, host1x_opcode_imm(0x902, 0));
+    grate_stream_push(stream, host1x_opcode_imm(0x903, 0));
+ 
+    grate_stream_push(stream, host1x_opcode_incr(0xa00, 13));
+-   grate_stream_push(stream, 0x00000e00); /* TGR3D_FDC_CONTROL */
++   grate_stream_push(stream, 0x00000e00 | TGR3D_FDC_CONTROL_INVALIDATE); /* TGR3D_FDC_CONTROL */
+    grate_stream_push(stream, 0x00000000);
+    grate_stream_push(stream, 0x000001ff);
+    grate_stream_push(stream, 0x000001ff);
+@@ -272,6 +340,9 @@ grate_init_state(struct grate_context *context)
+    grate_stream_push(stream, host1x_opcode_imm(0xe28, 0));
+    grate_stream_push(stream, host1x_opcode_imm(0xe29, 0));
+ 
++   grate_stream_push_words(stream, opentegra_state_reset,
++                           ARRAY_SIZE(opentegra_state_reset), 0);
++
+    if (context->tegra114) {
+       grate_stream_push(stream, host1x_opcode_imm(0x41a, 0xa00));
+       grate_stream_push(stream, host1x_opcode_imm(0x416, 0x140));
+@@ -375,12 +446,28 @@ grate_draw_vbo(struct pipe_context *pcontext,
+    value  = TGR3D_VAL(DRAW_PARAMS, INDEX_MODE, index_size);
+    value |= context->rast->draw_params;
+    value |= TGR3D_VAL(DRAW_PARAMS, PRIMITIVE_TYPE, grate_primitive_type(info->mode));
+-   value |= TGR3D_VAL(DRAW_PARAMS, FIRST, draws->start);
++   /*
++    * FIRST is the vertex base (as in opentegra); the first index / vertex
++    * is already in the index pointer or the DRAW_PRIMITIVES offset.
++    */
++   value |= TGR3D_VAL(DRAW_PARAMS, FIRST,
++                      info->index_size ? MAX2(draws->index_bias, 0) : 0);
+    value |= 0xC0000000; /* flush input caches? */
+ 
+    grate_stream_push(stream, host1x_opcode_incr(TGR3D_DRAW_PARAMS, 1));
+    grate_stream_push(stream, value);
+ 
++   /*
++    * As opentegra's tgr3d_draw_primitives(): cache / internal state
++    * maintenance, then wait until vertex and texture data have been read.
++    */
++   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x1));
++   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x1));
++   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x2));
++   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x3));
++   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x3));
++   grate_stream_sync(stream, DRM_TEGRA_SYNCPT_COND_RD_DONE);
++
+    assert(draws->count > 0 && draws->count < (1 << 11));
+    value  = TGR3D_VAL(DRAW_PRIMITIVES, INDEX_COUNT, draws->count - 1);
+    value |= TGR3D_VAL(DRAW_PRIMITIVES, OFFSET, offset);
+diff --git a/src/gallium/drivers/grate/grate_program.c b/src/gallium/drivers/grate/grate_program.c
+index a9d828b..f5911d0 100644
+--- a/src/gallium/drivers/grate/grate_program.c
++++ b/src/gallium/drivers/grate/grate_program.c
+@@ -132,6 +132,9 @@ grate_create_vs_state(struct pipe_context *pcontext,
+    so->blob.commands = commands;
+    so->blob.num_commands = num_commands;
+    so->output_mask = vp.output_mask;
++   so->imm_base = vp.num_consts;
++   so->num_immediates = vp.num_immediates;
++   memcpy(so->immediates, vp.immediates, sizeof(so->immediates));
+ 
+    return so;
+ }
+diff --git a/src/gallium/drivers/grate/grate_program.h b/src/gallium/drivers/grate/grate_program.h
+index 716443f..47445a4 100644
+--- a/src/gallium/drivers/grate/grate_program.h
++++ b/src/gallium/drivers/grate/grate_program.h
+@@ -15,6 +15,11 @@ struct grate_vertex_shader_state {
+    struct pipe_shader_state base;
+    struct grate_shader_blob blob;
+    uint16_t output_mask;
++
++   /* TGSI immediates, uploaded to constant slots imm_base.. at draw time */
++   unsigned imm_base;
++   unsigned num_immediates;
++   float immediates[GRATE_VP_MAX_IMMEDIATES][4];
+ };
+ 
+ struct grate_fragment_shader_state {
+diff --git a/src/gallium/drivers/grate/grate_resource.c b/src/gallium/drivers/grate/grate_resource.c
+index a661322..17fc58d 100644
+--- a/src/gallium/drivers/grate/grate_resource.c
++++ b/src/gallium/drivers/grate/grate_resource.c
+@@ -197,10 +197,18 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
+                          PIPE_BIND_SCANOUT | PIPE_BIND_DEPTH_STENCIL)) {
+       if (template->bind & PIPE_BIND_DEPTH_STENCIL)
+          resource->pitch = align(resource->pitch, 256);
++      else if (util_is_power_of_two_nonzero(template->width0) &&
++               util_is_power_of_two_nonzero(template->height0))
++         resource->pitch = align(resource->pitch, 16);
+       else
+-         resource->pitch = align(resource->pitch, 32);
+-
+-      flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
++         /* the texture sampler derives the pitch from the width */
++         resource->pitch = align(resource->pitch, 64);
++
++      /*
++       * No DRM_TEGRA_GEM_CREATE_BOTTOM_UP: the upstream display driver
++       * scans such buffers out vertically flipped, while gallium already
++       * stores rows top-down.
++       */
+    }
+ 
+    if (template->target != PIPE_BUFFER) {
+diff --git a/src/gallium/drivers/grate/grate_state.c b/src/gallium/drivers/grate/grate_state.c
+index dc51759..c973d6a 100644
+--- a/src/gallium/drivers/grate/grate_state.c
++++ b/src/gallium/drivers/grate/grate_state.c
+@@ -390,9 +390,15 @@ grate_create_zsa_state(struct pipe_context *pcontext,
+ 
+    so->base = *template;
+ 
++   /*
++    * The compare function applies even with the depth test off (gallium
++    * leaves it at NEVER then), so use ALWAYS like opentegra does.
++    */
+    uint32_t depth_test = 0;
+    depth_test |= TGR3D_VAL(DEPTH_TEST_PARAMS, FUNC,
+-                           grate_compare_func(template->depth_func));
++                           grate_compare_func(template->depth_enabled ?
++                                              template->depth_func :
++                                              PIPE_FUNC_ALWAYS));
+    depth_test |= TGR3D_BOOL(DEPTH_TEST_PARAMS, DEPTH_TEST,
+                             template->depth_enabled);
+    depth_test |= TGR3D_BOOL(DEPTH_TEST_PARAMS, DEPTH_WRITE,
+@@ -572,9 +578,16 @@ emit_render_targets(struct grate_context *context)
+       grate_stream_push(stream, rt_params);
+    }
+ 
+-   grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_PTR(0), fb->num_rts));
+-   for (i = 0; i < fb->num_rts; ++i)
++   /*
++    * RT 0 (depth/stencil) has no BO without a zsbuf and is off in the mask;
++    * skip its pointer (the host1x firewall rejects unrelocated addresses).
++    */
++   for (i = 0; i < fb->num_rts; ++i) {
++      if (!fb->bos[i])
++         continue;
++      grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_PTR(i), 1));
+       grate_stream_push_reloc(stream, fb->bos[i], 0);
++   }
+ 
+    grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_ENABLE, 1));
+    grate_stream_push(stream, fb->mask);
+@@ -626,6 +639,16 @@ emit_vs_uniforms(struct grate_context *context)
+       grate_stream_push(stream, host1x_opcode_nonincr(TGR3D_VP_UPLOAD_CONST, len));
+       grate_stream_push_words(stream, constbuf->user_buffer, len, 0);
+    }
++
++   /* after the constants: the user buffer may be larger than declared */
++   struct grate_vertex_shader_state *vs = context->vshader;
++   if (vs->num_immediates) {
++      len = vs->num_immediates * 4;
++      grate_stream_push(stream, host1x_opcode_imm(TGR3D_VP_UPLOAD_CONST_ID,
++                                                  vs->imm_base * 4));
++      grate_stream_push(stream, host1x_opcode_nonincr(TGR3D_VP_UPLOAD_CONST, len));
++      grate_stream_push_words(stream, vs->immediates, len, 0);
++   }
+ }
+ 
+ static void
+@@ -676,7 +699,8 @@ grate_emit_state(struct grate_context *context)
+ {
+    emit_render_targets(context);
+    emit_viewport(context);
+-   emit_guardband(context);
++   /* guardband stays at opentegra's 1.0 from grate_init_state() */
++   (void)emit_guardband;
+    emit_scissor(context);
+    emit_zsa_state(context);
+    emit_attribs(context);
+diff --git a/src/gallium/drivers/grate/grate_stream.c b/src/gallium/drivers/grate/grate_stream.c
+index 21c21e1..7f594e8 100644
+--- a/src/gallium/drivers/grate/grate_stream.c
++++ b/src/gallium/drivers/grate/grate_stream.c
+@@ -302,6 +302,28 @@ grate_stream_end(struct grate_stream *stream)
+    return 0;
+ }
+ 
++/* in-stream syncpoint increment once the engine reaches 'cond' */
++int
++grate_stream_sync(struct grate_stream *stream,
++                  enum drm_tegra_syncpt_cond cond)
++{
++   int ret;
++
++   if (!(stream && stream->status == GRATE_STREAM_CONSTRUCT)) {
++      ErrorMsg("Stream status isn't CONSTRUCT\n");
++      return -1;
++   }
++
++   ret = drm_tegra_pushbuf_sync(stream->buffer.pushbuf, cond);
++   if (ret != 0) {
++      stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
++      ErrorMsg("drm_tegra_pushbuf_sync() failed %d\n", ret);
++      return -1;
++   }
++
++   return 0;
++}
++
+ /*
+  * grate_reloc (variable, handle, offset)
+  *
+diff --git a/src/gallium/drivers/grate/grate_stream.h b/src/gallium/drivers/grate/grate_stream.h
+index 753fbd3..5bfc2db 100644
+--- a/src/gallium/drivers/grate/grate_stream.h
++++ b/src/gallium/drivers/grate/grate_stream.h
+@@ -77,6 +77,10 @@ grate_stream_begin(struct grate_stream *stream);
+ int
+ grate_stream_end(struct grate_stream *stream);
+ 
++int
++grate_stream_sync(struct grate_stream *stream,
++                  enum drm_tegra_syncpt_cond cond);
++
+ int
+ grate_stream_flush(struct grate_stream *stream);
+ 
+diff --git a/src/gallium/drivers/grate/vp/tgsi.c b/src/gallium/drivers/grate/vp/tgsi.c
+index f5b45cd..32ec269 100644
+--- a/src/gallium/drivers/grate/vp/tgsi.c
++++ b/src/gallium/drivers/grate/vp/tgsi.c
+@@ -3,6 +3,7 @@
+ 
+ #include "tgsi/tgsi_parse.h"
+ 
++#include "util/u_math.h"
+ #include "util/u_memory.h"
+ 
+ static struct vp_src_operand
+@@ -245,8 +246,9 @@ tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
+       return src_temp(src->Index, swizzle, negate, absolute);
+ 
+    case TGSI_FILE_IMMEDIATE:
+-      /* HACK: allocate uniforms from the top for immediates; need to actually record these */
+-      return uniform(1023 - src->Index, swizzle, negate, absolute);
++      /* uploaded after the constants, see grate_tgsi_to_vp() */
++      assert(src->Index < vp->num_immediates);
++      return uniform(vp->num_consts + src->Index, swizzle, negate, absolute);
+ 
+    default:
+       unreachable("unsupported input!");
+@@ -321,10 +323,30 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
+ {
+    list_inithead(&vp->instructions);
+    vp->output_mask = 0;
++   vp->num_consts = 0;
++   vp->num_immediates = 0;
+ 
+    while (!tgsi_parse_end_of_tokens(tgsi)) {
+       tgsi_parse_token(tgsi);
+       switch (tgsi->FullToken.Token.Type) {
++      case TGSI_TOKEN_TYPE_DECLARATION: {
++         const struct tgsi_full_declaration *decl = &tgsi->FullToken.FullDeclaration;
++         if (decl->Declaration.File == TGSI_FILE_CONSTANT)
++            vp->num_consts = MAX2(vp->num_consts, decl->Range.Last + 1);
++         break;
++      }
++
++      case TGSI_TOKEN_TYPE_IMMEDIATE: {
++         const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
++         assert(vp->num_immediates < GRATE_VP_MAX_IMMEDIATES);
++         assert(imm->Immediate.DataType == TGSI_IMM_FLOAT32);
++         for (int i = 0; i < 4; i++)
++            vp->immediates[vp->num_immediates][i] =
++               i < imm->Immediate.NrTokens - 1 ? imm->u[i].Float : 0.0f;
++         vp->num_immediates++;
++         break;
++      }
++
+       case TGSI_TOKEN_TYPE_INSTRUCTION:
+          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END) {
+             struct vp_instr *instr = tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction);
