@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=org.gnome.SettingsDaemon.Smartcard (disabled by NuraXoom: not needed on a Wi-Fi tablet, saves RAM)
+Hidden=true

@@ -368,3 +368,31 @@ NetworkManager instead of our wpa_supplicant/udhcpc, sshd and pmOS unudhcpd off,
 kernel 7.0.0-next-20260422-nuraxoom from the clean patch series. Blobs: Wi-Fi
 NVRAM from scripts/fetch-firmware.sh (archive.org, sha-checked), BT .hcd copied
 by the installer from /system. Not yet booted on hardware.
+
+## Wayland desktops (2026-11-01, on 0.4.0)
+- Alpine armv7 Mesa (libgallium 26.2.6) is built with NEON (readelf:
+  Tag_Advanced_SIMD_arch NEONv1). The Tegra 2 has none: glxgears and anything
+  else drawing through llvmpipe dies with SIGILL. Same root cause as Firefox.
+- Catacomb: SIGILL (smithay GLES, no software path) - cannot run.
+- Phosh: WORKS (slow) with WLR_RENDERER=pixman + GSK_RENDERER=cairo + seatd
+  (etc/tinydm.d/env-wayland.d/90-nuraxoom-nogl). postmarketos-ui-phosh enables
+  greetd: remove it from the default runlevel when tinydm is the DM.
+- Plasma Mobile/Desktop (KWin, no QPainter in Plasma 6) and Lomiri (Mir +
+  Qt Quick) need GL: expected to hit the same SIGILL. Not installed/tested.
+- Real fix for all GL users: a non-NEON Mesa build (or the GR3D driver).
+- apk "1 error" fixed: deviceinfo moved to /etc/deviceinfo, so the
+  postmarketos-mkinitfs trigger skips itself (it found no kernel package).
+- Phosh tuning (owner's tablet, Phosh now the default session there):
+  * The heavy load under Phosh was Sxmo's session left running after tinydm
+    stopped: autologin puts the session in its own cgroup, so
+    rc_cgroup_cleanup misses it; superd kept a 2nd PipeWire/WirePlumber
+    spinning (~64 % CPU). etc/conf.d/tinydm now records the session cgroup in
+    stop_pre and writes cgroup.kill in stop_post. CPU ~95 % idle afterwards.
+  * Animations off (gsettings org.gnome.desktop.interface enable-animations).
+  * etc/skel/.config/autostart hides gsd print/sharing/wwan/smartcard/usb/
+    color, Evolution alarms, mmsd, vvmd, geoclue demo: 607 MB available vs
+    <100 MB free before.
+  * Never restart pipewire-pulse under a running Phosh: its volume control
+    asserts in libpulse and takes the whole session down.
+  * CPU runs at 1 GHz always (no cpufreq for this board); custom Android
+    kernels ran 1.4-1.5 GHz with raised voltage - possible opt-in later.

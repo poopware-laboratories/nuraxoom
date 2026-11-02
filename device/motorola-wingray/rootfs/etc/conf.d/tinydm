@@ -1,0 +1,25 @@
+# Based on the file from postmarketos-base, plus NuraXoom's session cleanup.
+
+# this option is required for some DEs (e.g., Phosh) to be cleaned up fully so
+# they aren't automatically restarted by a child process
+rc_cgroup_cleanup="yes"
+
+# UID of user to autologin (pmOS default UID is 10000)
+AUTOLOGIN_UID=10000
+
+# The login moves the session into a cgroup of its own, out of reach of
+# rc_cgroup_cleanup: when tinydm stops, Sxmo's superd, PipeWire and friends
+# would keep running into the next desktop. Remember the session's cgroup and
+# kill it after stopping.
+stop_pre() {
+	_p=$(pgrep -f "^/usr/bin/autologin .*tinydm-run-session" | head -n1)
+	[ -n "$_p" ] && cut -d: -f3 "/proc/$_p/cgroup" > /run/nuraxoom-tinydm.cgroup
+	return 0
+}
+stop_post() {
+	_cg=$(cat /run/nuraxoom-tinydm.cgroup 2>/dev/null)
+	rm -f /run/nuraxoom-tinydm.cgroup
+	case "$_cg" in ""|/) return 0 ;; esac
+	[ -w "/sys/fs/cgroup$_cg/cgroup.kill" ] && echo 1 > "/sys/fs/cgroup$_cg/cgroup.kill"
+	return 0
+}

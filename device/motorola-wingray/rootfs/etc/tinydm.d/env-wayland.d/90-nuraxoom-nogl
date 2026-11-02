@@ -1,0 +1,6 @@
+# Sourced by tinydm-run-session before Wayland sessions.
+# Tegra 2 has no NEON, and Alpine's armv7 Mesa (llvmpipe) uses it: any GL drawing
+# dies with SIGILL. Draw wlroots compositors (phoc, sway) and GTK4 in software.
+export WLR_RENDERER=pixman
+export GSK_RENDERER=cairo
+export LIBSEAT_BACKEND=seatd

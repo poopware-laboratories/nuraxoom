@@ -1,3 +1,6 @@
+# Kept in /etc (pmOS reads both paths): with no /usr/share/deviceinfo/deviceinfo,
+# postmarketos-mkinitfs's apk trigger skips itself. It would otherwise fail on
+# every apk run - xoomboot, not mkinitfs, is this port's initramfs.
 deviceinfo_format_version="0"
 deviceinfo_name="Motorola Xoom (Wi-Fi, wingray)"
 deviceinfo_manufacturer="Motorola"
