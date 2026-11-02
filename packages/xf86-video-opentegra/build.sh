@@ -26,7 +26,9 @@ else
 	tar -xzf "$W/src.tar.gz" -C "$W"
 fi
 cd "$W/xf86-video-opentegra-$PIN"
-patch -p1 < "$HERE/0001-build-with-gcc-and-musl.patch"
+for p in "$HERE"/0*.patch; do
+	patch -p1 < "$p"
+done
 NOCONFIGURE=1 ./autogen.sh
 ./configure --prefix=/usr \
 	CFLAGS="-O2 -g -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard -fno-omit-frame-pointer"
