@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Auto-rotate
+Comment=Rotate the screen and touchscreen with the tablet (NuraXoom)
+Exec=/usr/bin/nuraxoom-autorotate
+OnlyShowIn=XFCE;LXQt;MATE;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,3 @@
+# Sxmo (dwm, X11), the stock postmarketOS Sxmo user interface
+postmarketos-ui-sxmo-de-dwm
+postmarketos-ui-sxmo-de-dwm-openrc

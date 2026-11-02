@@ -1,0 +1,31 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# nuraxoom-autorotate - follow the accelerometer in X11 desktops (Xfce, LXQt,
+# MATE): rotate the screen with xrandr and the touchscreen with it.
+# Started from /etc/xdg/autostart; Sxmo has its own autorotate job.
+# Turn it off for a user: touch ~/.config/nuraxoom/autorotate.off
+[ -e "$HOME/.config/nuraxoom/autorotate.off" ] && exit 0
+TOUCH="Atmel maXTouch Touchscreen"
+
+rotate() {
+	# $1 = xrandr orientation, $2.. = touchscreen coordinate matrix
+	o=$1; shift
+	[ "$o" = "$cur" ] && return
+	xrandr -o "$o" || return
+	xinput set-prop "$TOUCH" --type=float "Coordinate Transformation Matrix" "$@"
+	cur=$o
+}
+
+cur=
+monitor-sensor --accel | while read -r line; do
+	case "$line" in
+	*"orientation: normal"*|*"orientation changed: normal"*|*undefined*)
+		rotate normal 1 0 0 0 1 0 0 0 1 ;;
+	*bottom-up*)
+		rotate inverted -1 0 1 0 -1 1 0 0 1 ;;
+	*left-up*)
+		rotate left 0 -1 1 1 0 0 0 0 1 ;;
+	*right-up*)
+		rotate right 0 1 0 -1 0 1 0 0 1 ;;
+	esac
+done

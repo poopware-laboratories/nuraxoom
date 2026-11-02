@@ -1,0 +1,17 @@
+# Shared by the X11 desktops (xfce, lxqt, mate): tinydm starts the session,
+# Xorg runs through Xorg.wrap (no seatd/logind).
+tinydm
+tinydm-openrc
+xorg-server
+dbus-x11
+setxkbmap
+xrandr
+xinput
+onboard
+brightnessctl
+upower
+postmarketos-base-ui
+postmarketos-base-ui-audio
+postmarketos-base-ui-networkmanager
+network-manager-applet
+pavucontrol

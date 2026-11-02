@@ -1,6 +1,6 @@
-# Xorg driver for X11 sessions (Sxmo, LXQt): auto | opentegra | modesetting
-# opentegra (GPU 2D/3D EXA) is faster with kernel patch 0010 and was
-# tested in Sxmo and LXQt; modesetting is the long-verified fallback.
+# Xorg driver for the X11 desktops (Xfce, LXQt, MATE, Sxmo):
+# auto | opentegra | modesetting. opentegra = Tegra 2 GPU (2D + 3D EXA).
+# Images built with the opentegra driver ship "auto"; modesetting is the fallback.
 # auto = try Tegra 2D acceleration, fall back to modesetting if X fails twice.
 # Change with: nuraxoom-display <mode>
 modesetting

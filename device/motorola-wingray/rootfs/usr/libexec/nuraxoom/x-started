@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Called from the Sxmo xinit once X is running: remember a working driver.
+# Called once X is running (Sxmo xinit, or XDG autostart in Xfce/LXQt/MATE):
+# remember that this Xorg driver works.
 [ "$NURAXOOM_XDRIVER" = opentegra ] && touch /var/lib/nuraxoom/opentegra-ok
 exit 0

@@ -9,6 +9,11 @@
 # MODULES_DIR   output of scripts/build-kernel.sh (contains lib/modules/<release>)
 # FIRMWARE_DIR  output of scripts/fetch-firmware.sh (stock-wifi-nvram.txt)
 #
+# NURAXOOM_UI   desktops to install: xfce lxqt mate sxmo phosh (space or comma
+#               separated) or "all". Default: xfce.
+# NURAXOOM_SESSION  what starts on boot: one of the installed desktops, or
+#               console. Default: the first desktop in NURAXOOM_UI.
+#
 # Runs as root on an armv7-capable host: an ARM host, or x86/arm64 with
 # qemu-arm registered in binfmt_misc with the F flag (package scripts run in
 # the armv7 chroot). Needs network.
@@ -28,9 +33,16 @@ USER_NAME=user
 USER_UID=10000
 # Default password for "user" (doas, console login). Change it: passwd
 USER_PASS=${NURA_PASSWORD:-147147}
-# What starts on boot: console (tty1 + fbkeyboard) or sxmo (tinydm). Switch
-# later on the device with: doas nuraxoom-session console|sxmo
-SESSION=${NURAXOOM_SESSION:-sxmo}
+# Desktops in the image; switch on the device with: doas nuraxoom-session <name>
+UI=$(echo "${NURAXOOM_UI:-xfce}" | tr ',' ' ')
+[ "$UI" = all ] && UI="xfce lxqt mate sxmo phosh"
+for u in $UI; do
+	[ -f "$HERE/rootfs/ui/$u.txt" ] || { echo "unknown desktop: $u" >&2; exit 1; }
+done
+# What starts on boot: a desktop (through tinydm) or console (tty1 + fbkeyboard).
+SESSION=${NURAXOOM_SESSION:-${UI%% *}}
+case " $UI console " in *" $SESSION "*) ;; *) echo "NURAXOOM_SESSION=$SESSION is not in NURAXOOM_UI" >&2; exit 1 ;; esac
+has_ui() { case " $UI " in *" $1 "*) return 0 ;; esac; return 1; }
 # testing: Nura's networkmanager UI package needs routewrangler from there.
 REPOS="https://mirror.nura.eco/postmarketos/master
 https://dl-cdn.alpinelinux.org/alpine/edge/main
@@ -55,7 +67,11 @@ cp "$HERE"/rootfs/keys/*.pub "$R"/etc/apk/keys/
 printf '%s\n' "$REPOS" > "$R"/etc/apk/repositories
 # Our device files first, so package scripts see deviceinfo and the inittab.
 cp -a --no-preserve=ownership "$DEV"/rootfs/. "$R"/
-pkgs=$(sed 's/#.*//' "$HERE"/rootfs/packages.txt | xargs)
+lists="$HERE/rootfs/packages.txt"
+if has_ui xfce || has_ui lxqt || has_ui mate; then lists="$lists $HERE/rootfs/ui/x11.txt"; fi
+for u in $UI; do lists="$lists $HERE/rootfs/ui/$u.txt"; done
+pkgs=$(cat $lists | sed 's/#.*//' | xargs)
+echo ">> desktops: $UI (boot: $SESSION)"
 "$APK" --arch armv7 --root "$R" --initdb --update-cache --no-cache \
 	--keys-dir "$R"/etc/apk/keys --repositories-file "$R"/etc/apk/repositories \
 	add $pkgs || echo "apk reported errors; postmarketos-mkinitfs's trigger always fails here (no pmOS kernel package, xoomboot is the initramfs). Checking packages." >&2
@@ -118,6 +134,8 @@ install -Dm644 "$FW/stock-wifi-nvram.txt" "$R/usr/share/nuraxoom/stock-wifi-nvra
 # The Bluetooth .hcd is copied from the tablet's Android /system by the installer.
 if [ -n "$XDRV" ]; then
 	install -Dm755 "$XDRV" "$R/usr/lib/xorg/modules/drivers/opentegra_drv.so"
+	# opentegra (GPU), back to modesetting if X fails to start twice
+	sed -i 's/^modesetting$/auto/' "$R"/etc/nuraxoom/display
 else
 	echo modesetting > "$R"/etc/nuraxoom/display
 fi
@@ -130,22 +148,35 @@ rm -f "$R/usr/lib/modules/$KREL/build" "$R/usr/lib/modules/$KREL/source"
 depmod -b "$R/usr" "$KREL" 2>/dev/null || depmod -b "$R" "$KREL"
 echo "$KREL" > "$R"/usr/share/nuraxoom/kernel.release
 
-echo ">> home directory + Sxmo session"
+echo ">> home directory"
 H=$R/home/$USER_NAME
-mkdir -p "$H"/.config/sxmo "$H"/.local/state "$H"/.cache/sxmo
-# Suspend/resume is unverified on the Xoom: a failed resume looks like a dead
-# tablet. Sxmo > Config toggles this file.
-touch "$H"/.cache/sxmo/sxmo.nosuspend
+mkdir -p "$H"/.local/state
 cp -a "$R"/etc/skel/. "$H"/
-cp "$R"/usr/share/sxmo/appcfg/xinit_template "$H"/.config/sxmo/xinit
-printf '\n# NuraXoom: remember that this Xorg driver came up\n/usr/libexec/nuraxoom/x-started &\n' >> "$H"/.config/sxmo/xinit
-printf '\n# NuraXoom: follow the accelerometer (toggle: Menu > Config > Autorotate)\nsxmo_jobs.sh start autorotate sxmo_autorotate.sh &\n' >> "$H"/.config/sxmo/xinit
+if has_ui sxmo; then
+	mkdir -p "$H"/.config/sxmo "$H"/.cache/sxmo
+	# Suspend/resume is unverified on the Xoom: a failed resume looks like a dead
+	# tablet. Sxmo > Config toggles this file.
+	touch "$H"/.cache/sxmo/sxmo.nosuspend
+	cp "$R"/usr/share/sxmo/appcfg/xinit_template "$H"/.config/sxmo/xinit
+	printf '\n# NuraXoom: remember that this Xorg driver came up\n/usr/libexec/nuraxoom/x-started &\n' >> "$H"/.config/sxmo/xinit
+	printf '\n# NuraXoom: follow the accelerometer (toggle: Menu > Config > Autorotate)\nsxmo_jobs.sh start autorotate sxmo_autorotate.sh &\n' >> "$H"/.config/sxmo/xinit
+else
+	rm -rf "$H"/.config/sxmo
+fi
 ln -sfn /mnt/userdata/media/0 "$H"/sdcard
 chown -R $USER_UID:$USER_UID "$H"
 chmod 700 "$H"
 
 mkdir -p "$R"/var/lib/tinydm
-ln -sfn /usr/share/xsessions/sxmo.desktop "$R"/var/lib/tinydm/default-session.desktop
+case $SESSION in
+console) boot_ui=${UI%% *} ;;
+*) boot_ui=$SESSION ;;
+esac
+case $boot_ui in
+phosh) ln -sfn /usr/share/wayland-sessions/phosh.desktop "$R"/var/lib/tinydm/default-session.desktop ;;
+*) ln -sfn /usr/share/xsessions/$boot_ui.desktop "$R"/var/lib/tinydm/default-session.desktop ;;
+esac
+[ -e "$R$(readlink "$R"/var/lib/tinydm/default-session.desktop)" ] || { echo "no session file for $boot_ui" >&2; exit 1; }
 sed -i 's/^#\? *AUTOLOGIN_UID=.*/AUTOLOGIN_UID='$USER_UID'/' "$R"/etc/conf.d/tinydm
 mkdir -p "$R"/var/lib/nuraxoom "$R"/mnt/userdata
 chgrp 10 "$R"/var/lib/nuraxoom; chmod 2775 "$R"/var/lib/nuraxoom   # gid 10 = wheel
@@ -154,7 +185,9 @@ echo ">> services"
 rl() { mkdir -p "$R/etc/runlevels/$1"; ln -sfn "/etc/init.d/$2" "$R/etc/runlevels/$1/$2"; }
 echo "$SESSION" > "$R"/etc/nuraxoom/session
 rm -f "$R"/etc/runlevels/*/tinydm
-[ "$SESSION" = sxmo ] && rl default tinydm
+[ "$SESSION" != console ] && rl default tinydm
+# tinydm is the only login manager (phosh's greetd, LXQt's sddm stay off)
+rm -f "$R"/etc/runlevels/*/greetd "$R"/etc/runlevels/*/sddm "$R"/etc/runlevels/*/lightdm
 for s in nuraxoom-firstboot nuraxoom-wlan nuraxoom-logs nuraxoom-usb dbus bluetooth \
          networkmanager iio-sensor-proxy local udev-postmount postmarketos-zram-swap zram-init; do
 	[ -e "$R/etc/init.d/$s" ] && rl default $s

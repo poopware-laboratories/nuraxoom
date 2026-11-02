@@ -446,3 +446,30 @@ Full measurements and method: ../gpu/NOTES.md (outside this repo).
   3D jobs 24925 -> 1731 per benchmark run; tiny blended rects 7.6k -> 19.3k/s,
   blend 500x500 503 -> 1626/s, text 1952 -> 2649 lines/s. ../gpu/xbench
   `--verify` checksums are identical with merge on/off. Owner: LXQt + NetSurf fine.
+
+## Desktops: Xfce default, desktop choice at build time (2026-11-02)
+- Owner tried LXQt, Xfce and MATE on opentegra and picked Xfce. Measured after
+  login (40 s settle): Xfce ~300 MB used, LXQt ~405 MB, MATE ~455 MB; panel up
+  after 5-19 s (varies run to run).
+- rootfs/build-nura-rootfs.sh: NURAXOOM_UI=xfce|lxqt|mate|sxmo|phosh (several,
+  comma separated, or all; default xfce) adds rootfs/ui/<name>.txt (+ ui/x11.txt
+  for xfce/lxqt/mate). tinydm boots the first one (NURAXOOM_SESSION overrides,
+  console = text). Only tinydm is enabled (greetd/sddm/lightdm removed). The Sxmo
+  home setup is done only when Sxmo is in the image. postmarketos-ui-xfce4 is not
+  used: it brings lightdm.
+- With the opentegra driver given, /etc/nuraxoom/display = auto (opentegra, back
+  to modesetting after two failed X starts). x-started is now also an XDG
+  autostart for Xfce/LXQt/MATE (before, only Sxmo's xinit wrote opentegra-ok, so
+  auto would have fallen back under other desktops).
+- nuraxoom-autorotate (XDG autostart, Xfce/LXQt/MATE): monitor-sensor -> xrandr
+  -o + touchscreen matrix (same matrices as sxmo_rotate.sh). Off per user with
+  ~/.config/nuraxoom/autorotate.off. Owner: rotation works in Xfce.
+- Xfce: skel xfwm4.xml sets vblank_mode=xpresent (never GLX: no GL driver; About
+  shows llvmpipe, which is only Mesa's software GL).
+- nuraxoom-session console|xfce|lxqt|mate|sxmo|phosh switches tinydm's session.
+- Test build (VM, NURAXOOM_UI=xfce): 334 MB, 679 packages; session, display=auto,
+  driver, autostarts and runlevels checked in the tarball. Not installed on the
+  tablet (the owner's tablet has Xfce added by hand to the 0.4.1 install).
+- VM: qemu-arm binfmt must be registered again after a VM restart (see 0.3.0).
+- Open: one MATE start logged two rejected host1x jobs (-22, no kernel message);
+  did not happen again with merging on or off.
